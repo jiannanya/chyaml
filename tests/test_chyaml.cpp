@@ -82,6 +82,7 @@ tagged: !e!sensor value
 
     chyaml::event_parser events;
     assert(events.reset_borrowed(source));
+    assert(!events.buffered());
     chyaml::event parsed_event;
     std::size_t event_count = 0;
     std::size_t alias_count = 0;
@@ -97,6 +98,50 @@ tagged: !e!sensor value
     }
     assert(event_count > 20);
     assert(alias_count == 1);
+
+    constexpr std::string_view fast_source = R"(---
+device:
+  name: sensor
+  enabled: true
+  samples: [1, 2, 3]
+  empty: # comment
+...
+)";
+    constexpr std::string_view expected_scalars[] = {
+        "device", "name", "sensor", "enabled", "true", "samples", "1", "2", "3",
+        "empty", ""
+    };
+    assert(events.reset_borrowed(fast_source));
+    assert(events.buffered());
+    assert(events.buffered_event_count() == 21);
+    event_count = 0;
+    std::size_t scalar_count = 0;
+    bool saw_explicit_start = false;
+    bool saw_explicit_end = false;
+    while (events.next(parsed_event) == chyaml::event_status::event) {
+        ++event_count;
+        if (parsed_event.type == chyaml::event_type::document_start) {
+            assert(!parsed_event.implicit);
+            assert(parsed_event.line == 2 && parsed_event.column == 1);
+            saw_explicit_start = true;
+        }
+        if (parsed_event.type == chyaml::event_type::document_end) {
+            assert(!parsed_event.implicit);
+            assert(parsed_event.line == 7 && parsed_event.column == 1);
+            saw_explicit_end = true;
+        }
+        if (parsed_event.type == chyaml::event_type::scalar) {
+            assert(scalar_count < std::size(expected_scalars));
+            assert(parsed_event.value == expected_scalars[scalar_count++]);
+            if (scalar_count == 1)
+                assert(parsed_event.line == 2 && parsed_event.column == 1);
+        }
+    }
+    assert(!events.error());
+    assert(event_count == 21);
+    assert(scalar_count == std::size(expected_scalars));
+    assert(saw_explicit_start && saw_explicit_end);
+    assert(events.reset_borrowed(fast_source));
 
     chyaml::emit_options emit_options;
     emit_options.output_comments = true;

@@ -261,6 +261,8 @@ public:
     // Views in output remain valid until the next call to next() or clear().
     event_status next(event& output);
     const parse_error& error() const noexcept;
+    bool buffered() const noexcept;
+    std::size_t buffered_event_count() const noexcept;
     void* native_parser_handle() const noexcept;
     void* native_event_handle() const noexcept;
 

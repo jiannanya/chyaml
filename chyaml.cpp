@@ -8,6 +8,7 @@
 #include <cstring>
 #include <new>
 #include <utility>
+#include <vector>
 
 namespace chyaml {
 namespace {
@@ -151,6 +152,400 @@ int string_output(fy_emitter*, fy_emitter_write_type, const char* data,
     }
 }
 
+struct fast_event_record {
+    std::uint32_t offset{};
+    std::uint32_t length_type_variant{};
+
+    std::uint32_t length() const noexcept {
+        return length_type_variant & 0x00ffffffU;
+    }
+    event_type type() const noexcept {
+        return static_cast<event_type>((length_type_variant >> 24U) & 0x0fU);
+    }
+    bool variant() const noexcept { return (length_type_variant & 0x10000000U) != 0; }
+    node_style style() const noexcept {
+        switch (type()) {
+        case event_type::mapping_start:
+        case event_type::mapping_end: return node_style::block;
+        case event_type::sequence_start:
+        case event_type::sequence_end:
+            return variant() ? node_style::flow : node_style::block;
+        case event_type::scalar:
+            return variant() ? node_style::double_quoted : node_style::plain;
+        default: return node_style::any;
+        }
+    }
+    bool implicit() const noexcept {
+        const auto value_type = type();
+        return value_type == event_type::scalar ||
+               ((value_type == event_type::document_start ||
+                 value_type == event_type::document_end) && variant());
+    }
+};
+
+static_assert(sizeof(fast_event_record) == 8);
+
+struct fast_cursor {
+    std::size_t offset{};
+    std::size_t line{1};
+};
+
+struct fast_line {
+    fast_cursor after{};
+    std::size_t start{};
+    std::size_t end{};
+    std::size_t content{};
+    std::size_t indent{};
+    std::size_t line{};
+};
+
+struct fast_fragment {
+    std::size_t offset{};
+    std::size_t length{};
+    std::size_t line{};
+    std::size_t line_start{};
+};
+
+class fast_event_builder {
+public:
+    fast_event_builder(std::string_view input, std::vector<fast_event_record>& output)
+        : input_(input), output_(output) {}
+
+    bool build() {
+        if (input_.size() > UINT32_MAX) return false;
+        output_.clear();
+        try {
+            output_.reserve(input_.size() / 6U + 16U);
+            push(event_type::stream_start, node_style::any, {}, 0);
+
+            fast_cursor cursor{};
+            fast_line line{};
+            const auto first = peek(cursor, line);
+            if (first != scan_result::line || starts_with(line, "%")) return fail();
+
+            bool explicit_start = false;
+            if (equals(line, "---")) {
+                explicit_start = true;
+                cursor = line.after;
+                if (peek(cursor, line) != scan_result::line) return fail();
+            }
+            push(event_type::document_start, node_style::any, {}, line.content,
+                 !explicit_start);
+
+            if (!parse_node(cursor, line.indent)) return fail();
+
+            bool explicit_end = false;
+            std::size_t document_end_offset = cursor.offset;
+            const auto tail = peek(cursor, line);
+            if (tail == scan_result::line && equals(line, "...")) {
+                explicit_end = true;
+                document_end_offset = line.content;
+                cursor = line.after;
+            }
+            if (peek(cursor, line) != scan_result::end) return fail();
+
+            push(event_type::document_end, node_style::any, {}, document_end_offset,
+                 !explicit_end);
+            push(event_type::stream_end, node_style::any, {}, cursor.offset);
+            return true;
+        } catch (...) {
+            return fail();
+        }
+    }
+
+private:
+    enum class scan_result { line, end };
+
+    std::string_view input_;
+    std::vector<fast_event_record>& output_;
+
+    bool fail() noexcept {
+        output_.clear();
+        return false;
+    }
+
+    static bool ascii_space(char c) noexcept { return c == ' ' || c == '\r'; }
+
+    scan_result peek(fast_cursor cursor, fast_line& output) const noexcept {
+        while (cursor.offset < input_.size()) {
+            const std::size_t start = cursor.offset;
+            std::size_t end = input_.find('\n', start);
+            const bool has_newline = end != std::string_view::npos;
+            if (!has_newline) end = input_.size();
+            std::size_t logical_end = end;
+            if (logical_end > start && input_[logical_end - 1] == '\r') --logical_end;
+
+            std::size_t content = start;
+            while (content < logical_end && input_[content] == ' ') ++content;
+
+            fast_cursor after{has_newline ? end + 1 : end,
+                              cursor.line + (has_newline ? 1U : 0U)};
+            if (content == logical_end || input_[content] == '#') {
+                cursor = after;
+                continue;
+            }
+            output = {after, start, logical_end, content, content - start, cursor.line};
+            return scan_result::line;
+        }
+        return scan_result::end;
+    }
+
+    bool equals(const fast_line& line, std::string_view text) const noexcept {
+        return input_.substr(line.content, line.end - line.content) == text;
+    }
+
+    bool starts_with(const fast_line& line, std::string_view text) const noexcept {
+        const auto value = input_.substr(line.content, line.end - line.content);
+        return value.size() >= text.size() && value.substr(0, text.size()) == text;
+    }
+
+    fast_fragment fragment(const fast_line& line) const noexcept {
+        return {line.content, line.end - line.content, line.line, line.start};
+    }
+
+    fast_fragment trim(fast_fragment value) const noexcept {
+        while (value.length && ascii_space(input_[value.offset])) {
+            ++value.offset;
+            --value.length;
+        }
+        while (value.length && ascii_space(input_[value.offset + value.length - 1]))
+            --value.length;
+        return value;
+    }
+
+    bool is_sequence_item(fast_fragment value) const noexcept {
+        value = trim(value);
+        return value.length && input_[value.offset] == '-' &&
+               (value.length == 1 || input_[value.offset + 1] == ' ');
+    }
+
+    bool split_pair(fast_fragment value, fast_fragment& key,
+                    fast_fragment& mapped) const noexcept {
+        value = trim(value);
+        if (!value.length || input_[value.offset] == '?' || input_[value.offset] == '\'' ||
+            input_[value.offset] == '"') return false;
+        for (std::size_t i = 0; i < value.length; ++i) {
+            if (input_[value.offset + i] != ':') continue;
+            if (i + 1 != value.length && input_[value.offset + i + 1] != ' ') continue;
+            key = trim({value.offset, i, value.line, value.line_start});
+            mapped = trim({value.offset + i + 1, value.length - i - 1,
+                           value.line, value.line_start});
+            return key.length != 0 && safe_plain(key);
+        }
+        return false;
+    }
+
+    bool safe_plain(fast_fragment value) const noexcept {
+        for (std::size_t i = 0; i < value.length; ++i) {
+            switch (input_[value.offset + i]) {
+            case '\t': case '&': case '*': case '!': case '{': case '}':
+            case '[': case ']': case '|': case '>': case '\'': case '"':
+                return false;
+            case '#':
+                if (i == 0 || input_[value.offset + i - 1] == ' ') return false;
+                break;
+            default: break;
+            }
+        }
+        return true;
+    }
+
+    bool prepare_plain_value(fast_fragment& value) const noexcept {
+        for (std::size_t i = 0; i < value.length; ++i) {
+            const char current = input_[value.offset + i];
+            switch (current) {
+            case '\t': case '&': case '*': case '!': case '{': case '}':
+            case '[': case ']': case '|': case '>': case '\'': case '"':
+                return false;
+            case '#':
+                if (i == 0 || input_[value.offset + i - 1] == ' ') {
+                    value.length = i;
+                    value = trim(value);
+                    return true;
+                }
+                break;
+            default: break;
+            }
+        }
+        return true;
+    }
+
+    void push(event_type type, node_style style, fast_fragment value,
+              std::size_t location, bool implicit = false) {
+        const bool variant = implicit || style == node_style::flow ||
+                             style == node_style::double_quoted;
+        if (location > UINT32_MAX || value.length >= (1U << 24U))
+            throw std::bad_alloc{};
+        const auto packed_value = static_cast<std::uint32_t>(value.length) |
+            (static_cast<std::uint32_t>(type) << 24U) |
+            (variant ? 0x10000000U : 0U);
+        output_.push_back({static_cast<std::uint32_t>(location), packed_value});
+    }
+
+    void push_scalar(fast_fragment value, node_style style) {
+        push(event_type::scalar, style, value, value.offset, true);
+    }
+
+    bool parse_node(fast_cursor& cursor, std::size_t indent) {
+        fast_line line{};
+        if (peek(cursor, line) != scan_result::line || line.indent != indent) return false;
+        const auto value = fragment(line);
+        if (is_sequence_item(value)) return parse_sequence(cursor, indent);
+        fast_fragment key{}, mapped{};
+        if (split_pair(value, key, mapped)) return parse_mapping(cursor, indent);
+
+        cursor = line.after;
+        return parse_value(value);
+    }
+
+    bool parse_mapping(fast_cursor& cursor, std::size_t indent) {
+        fast_line first{};
+        if (peek(cursor, first) != scan_result::line) return false;
+        push(event_type::mapping_start, node_style::block, {}, first.content);
+
+        for (;;) {
+            fast_line line{};
+            const auto result = peek(cursor, line);
+            if (result == scan_result::end || line.indent < indent) break;
+            if (line.indent == 0 && equals(line, "...")) break;
+            if (line.indent != indent || is_sequence_item(fragment(line))) return false;
+
+            fast_fragment key{}, mapped{};
+            if (!split_pair(fragment(line), key, mapped)) return false;
+            cursor = line.after;
+            if (!process_pair(cursor, indent, key, mapped)) return false;
+        }
+
+        push(event_type::mapping_end, node_style::block, {}, cursor.offset);
+        return true;
+    }
+
+    bool process_pair(fast_cursor& cursor, std::size_t indent,
+                      fast_fragment key, fast_fragment mapped) {
+        push_scalar(key, node_style::plain);
+        if (mapped.length) return parse_value(mapped);
+
+        fast_line next{};
+        const auto result = peek(cursor, next);
+        if (result == scan_result::line && next.indent > indent)
+            return parse_node(cursor, next.indent);
+        push_scalar({key.offset + key.length, 0, key.line, key.line_start}, node_style::plain);
+        return true;
+    }
+
+    bool parse_sequence(fast_cursor& cursor, std::size_t indent) {
+        fast_line first{};
+        if (peek(cursor, first) != scan_result::line) return false;
+        push(event_type::sequence_start, node_style::block, {}, first.content);
+
+        for (;;) {
+            fast_line line{};
+            const auto result = peek(cursor, line);
+            if (result == scan_result::end || line.indent < indent) break;
+            if (line.indent == 0 && equals(line, "...")) break;
+            auto item = trim(fragment(line));
+            if (line.indent != indent || !is_sequence_item(item)) return false;
+
+            item.offset += 1;
+            item.length -= 1;
+            item = trim(item);
+            cursor = line.after;
+            if (!item.length) {
+                fast_line next{};
+                if (peek(cursor, next) != scan_result::line || next.indent <= indent ||
+                    !parse_node(cursor, next.indent)) return false;
+                continue;
+            }
+
+            fast_fragment key{}, mapped{};
+            if (split_pair(item, key, mapped)) {
+                if (!mapped.length) return false;
+                push(event_type::mapping_start, node_style::block, {}, item.offset);
+                if (!process_pair(cursor, indent + 1, key, mapped)) return false;
+
+                fast_line next{};
+                auto next_result = peek(cursor, next);
+                if (next_result == scan_result::line && next.indent > indent) {
+                    const std::size_t mapping_indent = next.indent;
+                    while (next_result == scan_result::line && next.indent == mapping_indent &&
+                           !is_sequence_item(fragment(next))) {
+                        if (!split_pair(fragment(next), key, mapped)) return false;
+                        cursor = next.after;
+                        if (!process_pair(cursor, mapping_indent, key, mapped)) return false;
+                        next_result = peek(cursor, next);
+                    }
+                    if (next_result == scan_result::line && next.indent > indent &&
+                        next.indent != mapping_indent) return false;
+                }
+                push(event_type::mapping_end, node_style::block, {}, cursor.offset);
+            } else if (!parse_value(item)) {
+                return false;
+            }
+        }
+
+        push(event_type::sequence_end, node_style::block, {}, cursor.offset);
+        return true;
+    }
+
+    bool parse_value(fast_fragment value) {
+        value = trim(value);
+        if (!value.length) {
+            push_scalar(value, node_style::plain);
+            return true;
+        }
+        const char first = input_[value.offset];
+        if (first == '[') return parse_flow_sequence(value);
+        if (first == '"') {
+            if (value.length < 2 || input_[value.offset + value.length - 1] != '"') return false;
+            for (std::size_t i = 1; i + 1 < value.length; ++i)
+                if (input_[value.offset + i] == '\\') return false;
+            ++value.offset;
+            value.length -= 2;
+            push_scalar(value, node_style::double_quoted);
+            return true;
+        }
+        if (!prepare_plain_value(value)) return false;
+        push_scalar(value, node_style::plain);
+        return true;
+    }
+
+    bool parse_flow_sequence(fast_fragment value) {
+        if (value.length < 2 || input_[value.offset + value.length - 1] != ']') return false;
+        push(event_type::sequence_start, node_style::flow, {}, value.offset);
+        std::size_t cursor = value.offset + 1;
+        const std::size_t end = value.offset + value.length - 1;
+        while (cursor < end) {
+            while (cursor < end && input_[cursor] == ' ') ++cursor;
+            if (cursor == end) break;
+            const std::size_t start = cursor;
+            bool quoted = false;
+            if (input_[cursor] == '"') {
+                quoted = true;
+                ++cursor;
+                while (cursor < end && input_[cursor] != '"') {
+                    if (input_[cursor] == '\\') return false;
+                    ++cursor;
+                }
+                if (cursor == end) return false;
+                ++cursor;
+            } else {
+                while (cursor < end && input_[cursor] != ',') ++cursor;
+            }
+            const std::size_t item_end = cursor;
+            while (cursor < end && input_[cursor] == ' ') ++cursor;
+            if (cursor < end && input_[cursor] != ',') return false;
+            fast_fragment item{start, item_end - start, value.line, value.line_start};
+            item = trim(item);
+            if (!parse_value(item)) return false;
+            if (quoted && item.length < 2) return false;
+            if (cursor < end) ++cursor;
+        }
+        push(event_type::sequence_end, node_style::flow, {},
+             value.offset + value.length - 1);
+        return true;
+    }
+};
+
 } // namespace
 
 struct document::impl {
@@ -189,14 +584,94 @@ struct event_parser::impl {
     fy_parser* parser{nullptr};
     fy_event* current{nullptr};
     std::string owned_input{};
+    std::string_view fast_input{};
+    std::vector<fast_event_record> fast_events{};
+    std::size_t fast_index{};
+    std::size_t fast_scan_offset{};
+    std::size_t fast_scan_line{1};
+    std::size_t fast_scan_line_start{};
+    bool fast_mode{false};
+    parse_options configured_options{};
+    bool has_configured_options{false};
     parse_error error_value{};
 
+#if defined(CHYAML_FAST_EVENTS_ONLY)
+    impl() = default;
+#else
     impl() : diagnostic(create_diagnostic(diagnostic_state_value)) {}
+#endif
 
     ~impl() {
+#if !defined(CHYAML_FAST_EVENTS_ONLY)
         if (current && parser) fy_parser_event_free(parser, current);
         if (parser) fy_parser_destroy(parser);
         if (diagnostic) fy_diag_destroy(diagnostic);
+#endif
+    }
+
+    void release_current() noexcept {
+#if !defined(CHYAML_FAST_EVENTS_ONLY)
+        if (current && parser) fy_parser_event_free(parser, current);
+#endif
+        current = nullptr;
+    }
+
+    void reset_diagnostic() {
+        diagnostic_state_value.output.clear();
+        error_value = {};
+#if !defined(CHYAML_FAST_EVENTS_ONLY)
+        if (diagnostic) fy_diag_reset_error(diagnostic);
+#endif
+    }
+
+    bool same_configuration(parse_options options) const noexcept {
+        return has_configured_options &&
+               configured_options.profile == options.profile &&
+               configured_options.preserve_comments == options.preserve_comments &&
+               configured_options.resolve_aliases == options.resolve_aliases &&
+               configured_options.allow_duplicate_keys == options.allow_duplicate_keys;
+    }
+
+    bool prepare_core(parse_options options) {
+#if defined(CHYAML_FAST_EVENTS_ONLY)
+        (void)options;
+        return false;
+#else
+        fast_mode = false;
+        fast_input = {};
+        fast_index = 0;
+        release_current();
+        reset_diagnostic();
+        if (parser && same_configuration(options))
+            return fy_parser_reset(parser) == 0;
+        if (parser) fy_parser_destroy(parser);
+        parser = nullptr;
+        const auto config = make_parse_config(diagnostic, options);
+        parser = fy_parser_create(&config);
+        if (!parser) return false;
+        configured_options = options;
+        has_configured_options = true;
+        return true;
+#endif
+    }
+
+    bool prepare_fast(std::string_view input, parse_options options) {
+        if (options.profile != parse_profile::fast || options.preserve_comments ||
+            options.resolve_aliases) return false;
+        fast_event_builder builder(input, fast_events);
+        if (!builder.build()) return false;
+        release_current();
+#if !defined(CHYAML_FAST_EVENTS_ONLY)
+        if (parser) fy_parser_reset(parser);
+#endif
+        reset_diagnostic();
+        fast_input = input;
+        fast_index = 0;
+        fast_scan_offset = 0;
+        fast_scan_line = 1;
+        fast_scan_line_start = 0;
+        fast_mode = true;
+        return true;
     }
 };
 
@@ -715,31 +1190,30 @@ void event_parser::clear() noexcept {
 }
 
 bool event_parser::reset_borrowed(std::string_view yaml, parse_options options) {
-    clear();
-    impl_ = new (std::nothrow) impl;
+    if (!impl_) impl_ = new (std::nothrow) impl;
     if (!impl_) return false;
+    impl_->owned_input.clear();
+    if (impl_->prepare_fast(yaml, options)) return true;
+#if defined(CHYAML_FAST_EVENTS_ONLY)
+    impl_->error_value.message = "input is outside the portable fast event profile";
+    return false;
+#else
     if (!impl_->diagnostic) {
         impl_->error_value.message = "failed to create diagnostic context";
         return false;
     }
-    const auto config = make_parse_config(impl_->diagnostic, options);
-    impl_->parser = fy_parser_create(&config);
-    if (!impl_->parser || fy_parser_set_string(
+    if (!impl_->prepare_core(options) || fy_parser_set_string(
             impl_->parser, input_data(yaml), yaml.size()) != 0) {
         impl_->error_value.message = "failed to initialize YAML event stream";
         return false;
     }
     return true;
+#endif
 }
 
 bool event_parser::reset_copy(std::string_view yaml, parse_options options) {
-    clear();
-    impl_ = new (std::nothrow) impl;
+    if (!impl_) impl_ = new (std::nothrow) impl;
     if (!impl_) return false;
-    if (!impl_->diagnostic) {
-        impl_->error_value.message = "failed to create diagnostic context";
-        return false;
-    }
     try {
         if (yaml.empty()) impl_->owned_input.clear();
         else impl_->owned_input.assign(yaml.data(), yaml.size());
@@ -747,20 +1221,33 @@ bool event_parser::reset_copy(std::string_view yaml, parse_options options) {
         impl_->error_value.message = "failed to copy YAML event stream";
         return false;
     }
-    const auto config = make_parse_config(impl_->diagnostic, options);
-    impl_->parser = fy_parser_create(&config);
-    if (!impl_->parser || fy_parser_set_string(
+    if (impl_->prepare_fast(impl_->owned_input, options)) return true;
+#if defined(CHYAML_FAST_EVENTS_ONLY)
+    impl_->error_value.message = "input is outside the portable fast event profile";
+    return false;
+#else
+    if (!impl_->diagnostic) {
+        impl_->error_value.message = "failed to create diagnostic context";
+        return false;
+    }
+    if (!impl_->prepare_core(options) || fy_parser_set_string(
             impl_->parser, input_data(impl_->owned_input), impl_->owned_input.size()) != 0) {
         impl_->error_value.message = "failed to initialize YAML event stream";
         return false;
     }
     return true;
+#endif
 }
 
 bool event_parser::reset_file(std::string_view path, parse_options options) {
-    clear();
-    impl_ = new (std::nothrow) impl;
+    if (!impl_) impl_ = new (std::nothrow) impl;
     if (!impl_) return false;
+#if defined(CHYAML_FAST_EVENTS_ONLY)
+    (void)path;
+    (void)options;
+    impl_->error_value.message = "file parsing requires the full event fallback";
+    return false;
+#else
     if (!impl_->diagnostic) {
         impl_->error_value.message = "failed to create diagnostic context";
         return false;
@@ -773,18 +1260,48 @@ bool event_parser::reset_file(std::string_view path, parse_options options) {
         impl_->error_value.message = "failed to copy input path";
         return false;
     }
-    const auto config = make_parse_config(impl_->diagnostic, options);
-    impl_->parser = fy_parser_create(&config);
-    if (!impl_->parser || fy_parser_set_input_file(impl_->parser, filename.c_str()) != 0) {
+    impl_->owned_input.clear();
+    if (!impl_->prepare_core(options) ||
+        fy_parser_set_input_file(impl_->parser, filename.c_str()) != 0) {
         impl_->error_value.message = "failed to open YAML event stream";
         return false;
     }
     return true;
+#endif
 }
 
 event_status event_parser::next(event& output) {
     output = {};
-    if (!impl_ || !impl_->parser) return event_status::error;
+    if (!impl_) return event_status::error;
+    if (impl_->fast_mode) {
+        if (impl_->fast_index >= impl_->fast_events.size()) return event_status::end;
+        const auto& source = impl_->fast_events[impl_->fast_index++];
+        output.type = source.type();
+        output.style = source.style();
+        output.implicit = source.implicit();
+        const std::size_t location = source.offset;
+        if (location < impl_->fast_scan_offset) {
+            impl_->fast_scan_offset = 0;
+            impl_->fast_scan_line = 1;
+            impl_->fast_scan_line_start = 0;
+        }
+        while (impl_->fast_scan_offset < location) {
+            if (impl_->fast_input[impl_->fast_scan_offset] == '\n') {
+                ++impl_->fast_scan_line;
+                impl_->fast_scan_line_start = impl_->fast_scan_offset + 1;
+            }
+            ++impl_->fast_scan_offset;
+        }
+        output.line = impl_->fast_scan_line;
+        output.column = location - impl_->fast_scan_line_start + 1;
+        if (output.type == event_type::scalar)
+            output.value = impl_->fast_input.substr(source.offset, source.length());
+        return event_status::event;
+    }
+#if defined(CHYAML_FAST_EVENTS_ONLY)
+    return event_status::error;
+#else
+    if (!impl_->parser) return event_status::error;
     if (impl_->current) {
         fy_parser_event_free(impl_->parser, impl_->current);
         impl_->current = nullptr;
@@ -833,18 +1350,35 @@ event_status event_parser::next(event& output) {
         if (mark->column >= 0) output.column = static_cast<std::size_t>(mark->column) + 1;
     }
     return event_status::event;
+#endif
 }
 
 const parse_error& event_parser::error() const noexcept {
     return impl_ ? impl_->error_value : empty_error();
 }
 
+bool event_parser::buffered() const noexcept {
+    return impl_ && impl_->fast_mode;
+}
+
+std::size_t event_parser::buffered_event_count() const noexcept {
+    return impl_ && impl_->fast_mode ? impl_->fast_events.size() : 0;
+}
+
 void* event_parser::native_parser_handle() const noexcept {
+#if defined(CHYAML_FAST_EVENTS_ONLY)
+    return nullptr;
+#else
     return impl_ ? impl_->parser : nullptr;
+#endif
 }
 
 void* event_parser::native_event_handle() const noexcept {
+#if defined(CHYAML_FAST_EVENTS_ONLY)
+    return nullptr;
+#else
     return impl_ ? impl_->current : nullptr;
+#endif
 }
 
 } // namespace chyaml

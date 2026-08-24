@@ -1,286 +1,256 @@
+[English README](README.md)
+
 # chyaml
 
-`chyaml` 是一个面向嵌入式与资源受限程序的极简 C++20 YAML 子集解析器/写入器。整个库只有一个头文件 `chyaml.hpp`，没有第三方依赖，也不需要单独编译或链接。
+`chyaml` 是一个编译型 C++20 [YAML 1.2.2](https://yaml.org/spec/1.2.2/) 解析器与写入器，首要优化目标是吞吐量和内存占用。它使用两条互补路径：
 
-设计目标：
+- 可移植的纯标量快路径：把常见 YAML 物化为每事件 8 字节的事件带，字符串直接引用输入；
+- 完整 YAML 1.2.2 路径：支持指令、多文档、锚点、别名、标签、复杂键、块标量、流式集合、注释及其他标准语法。
 
-- 快：单次线性扫描，解析期间不创建字符串副本；
-- 省内存：每个解析节点固定占 20 字节，字符串直接引用输入；
-- 小：单头文件、API 精简、未使用的模板写入代码不会实例化；
-- 可控：默认最大嵌套深度为 32，可在编译期调整；
-- 适合 MCU：写入器可直接写入固定缓冲区，全程不分配堆内存。
+默认构建不会添加 SIMD intrinsic、`-march=native`、`/arch:*` 或函数目标属性。`CHYAML_PORTABLE=ON` 还会关闭完整解析依赖中的可选 CPU 专用目标。
 
-## 支持的 YAML 子集
+## 环境要求
 
-支持：
+- 支持 C++20 的编译器；
+- CMake 3.21 或更高版本；
+- 用于编译完整解析核心的 C17 编译器。
 
-- 基于空格缩进的块映射；
-- 块序列，包括标量序列和对象序列；
-- `- key: value` 紧凑对象写法；
-- 单引号、双引号、常见双引号转义；
-- 行尾注释与整行注释；
-- `null`、布尔值、整数、浮点数和字符串读取；
-- `---`、`...` 与 `%...` 行的跳过。
+默认构建会获取固定版本的 [libfyaml 0.9.6](https://github.com/pantoniou/libfyaml/releases/tag/v0.9.6)。应用只需包含 `chyaml.hpp`；依赖头文件不会泄漏到公开 API。
 
-有意不支持：
-
-- 锚点、别名、标签与复杂键；
-- `|`、`>` 多行标量；
-- flow collection 的结构化解析，`[a, b]` 和 `{a: b}` 仅作为普通标量保留；
-- 多文档语义、隐式类型系统和完整 YAML 规范兼容；
-- Tab 缩进、同一容器内混合映射项与序列项。
-
-输入应由本库的写入器生成，或遵循上述简单格式。缩进宽度可以变化，但同级节点必须对齐；建议始终使用两个空格。
-
-## 引入
-
-```cpp
-#include "chyaml.hpp"
-```
-
-编译时启用 C++20：
+## 构建与链接
 
 ```sh
-g++ -std=c++20 app.cpp
-clang++ -std=c++20 app.cpp
+cmake -S . -B build/release \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCHYAML_OPTIMIZE_FOR=SPEED \
+  -DCHYAML_PORTABLE=ON
+cmake --build build/release -j
+ctest --test-dir build/release --output-on-failure
 ```
 
-MSVC 使用 `/std:c++20`。
+使用多配置生成器时，请给构建和测试命令增加 `--config Release`。
 
-## 快速读取
+作为子目录使用：
+
+```cmake
+add_subdirectory(path/to/chyaml)
+target_link_libraries(my_app PRIVATE chyaml::chyaml)
+target_compile_features(my_app PRIVATE cxx_std_20)
+```
+
+通过 `add_subdirectory()` 引入时，测试与基准默认不构建。
+
+## 快速事件解析
+
+对于配置型 YAML，使用 `event_parser` 可获得最高吞吐量和最低保留内存：
 
 ```cpp
 #include "chyaml.hpp"
+
 #include <string_view>
 
-int main() {
-    constexpr std::string_view text = R"(
-device:
-  name: "pump-a"
-  rate: 120
-  enabled: true
-  pins:
-    - 3
-    - 5
-)";
+bool consume(std::string_view yaml) {
+    chyaml::parse_options options;
+    options.profile = chyaml::parse_profile::fast;
 
-    chyaml::document doc;
-    if (!doc.parse(text)) {
-        const auto e = doc.error();
-        // chyaml::message(e.code), e.line, e.column
-        return 1;
+    chyaml::event_parser parser;
+    if (!parser.reset_borrowed(yaml, options)) return false;
+
+    chyaml::event event;
+    while (parser.next(event) == chyaml::event_status::event) {
+        if (event.type == chyaml::event_type::scalar) {
+            // 在下一次 next() 调用前使用 event.value。
+        }
     }
-
-    const auto device = doc.root()["device"];
-    const auto name = device["name"].value_or<std::string_view>({});
-    const int rate = device["rate"].value_or(0);
-    const bool enabled = device["enabled"].value_or(false);
-
-    const auto pins = device["pins"];
-    for (std::size_t i = 0; i < pins.size(); ++i) {
-        const int pin = pins[i].value_or(-1);
-        (void)pin;
-    }
-    (void)name;
-    (void)rate;
-    (void)enabled;
+    return !parser.error();
 }
 ```
 
-`operator[]("key")` 查找直属映射子节点，`operator[](index)` 取得直属子节点。查找失败会返回无效节点，可直接用于条件判断。
+当前可移植快路径接受包含以下内容的单个文档：
 
-```cpp
-if (auto port = doc.root()["network"]["port"]) {
-    int value = 0;
-    if (port.read(value)) {
-        // 使用 value
-    }
-}
-```
+- 块映射和块序列；
+- `- id: 7` 形式的紧凑序列映射；
+- 普通标量，以及不含转义的简单双引号标量；
+- `[1, 2, 3]` 形式的标量流式序列；
+- 空行、注释，以及可选的 `---` / `...` 标记。
+
+这是一个优化档位，不是缩减后的公开语法。快路径不支持的语法会自动回退到完整事件解析器。`preserve_comments=true`、`resolve_aliases=true`、文件输入和 `parse_profile::compact` 会直接使用完整路径。诊断或基准程序如需知道实际选择了哪条路径，可在 reset 后调用 `buffered()`。
+
+快速事件带为每个事件保存两个 32 位字。标量文本留在调用方缓冲区中；消费事件时，通过一次单调扫描恢复行列位置。复用同一个 `event_parser` 还会复用事件带容量。
 
 ### 输入生命周期
 
-`parse()` 是最快、最省内存的借用模式。节点中的字符串视图直接指向传入文本，因此文本必须在 `document` 及其节点使用期间保持有效且地址不变。
+`reset_borrowed()` 不拥有输入。解析和事件消费结束前，源数据必须保持存活且地址稳定。解析器需要拥有输入时请使用 `reset_copy()`。事件中的字符串视图只保证有效到下一次 `next()` 调用或 `clear()`。
+
+完整事件路径可能在 `next()` 期间才报告语法错误，因此始终要检查最终状态和 `error()`。
+
+## 最低内存的完整流式解析
+
+`parse_profile::compact` 会关闭解析器缓冲与加速器。需要完整 YAML 支持和有界工作内存、但不追求最高吞吐量时，优先使用此模式：
 
 ```cpp
-std::string yaml = load_file();
-chyaml::document doc;
-doc.parse(yaml);            // doc 借用 yaml
+chyaml::parse_options options;
+options.profile = chyaml::parse_profile::compact;
+
+chyaml::event_parser parser;
+if (!parser.reset_borrowed(yaml, options)) return false;
+
+chyaml::event event;
+while (parser.next(event) == chyaml::event_status::event) {
+    // 逐个处理并丢弃事件。
+}
+return !parser.error();
 ```
 
-如果需要让文档拥有输入，使用 `parse_copy()`：
+## DOM 解析
+
+需要随机查找、别名解析、编辑和输出时使用 `document`：
 
 ```cpp
-chyaml::document doc;
-doc.parse_copy(load_file());
+constexpr std::string_view yaml = R"(
+defaults: &base
+  enabled: true
+devices:
+  - name: sensor-a
+    settings: *base
+)";
+
+chyaml::document document;
+if (!document.parse_borrowed(yaml)) {
+    const auto& error = document.error();
+    // error.message、error.line、error.column
+    return 1;
+}
+
+const auto first = document.root()["devices"][0];
+const auto name = first["name"].scalar();
+
+bool enabled = false;
+first["settings"].resolve_alias()["enabled"].as_bool(enabled);
 ```
 
-两种模式都不会修改输入。`doc.owns_source()` 可用于区分模式，`shrink_to_fit()` 可在解析完成后尽量回收多余容量。
+主要节点操作包括：
 
-### 节点类型与字符串
+- `find()` / `operator[]`：查找简单标量键；
+- `find_yaml_key()`：查找复杂 YAML 键；
+- `at()` 和 `pair_at()`：支持负数索引；
+- `by_path()`：按斜杠分隔路径查找；
+- `scalar()`、`tag()`、`anchor()` 和 `resolve_alias()`；
+- `as_bool()`、`as_int64()`、`as_uint64()` 和 `as_double()`。
 
-```cpp
-auto n = doc.root()["items"];
+`parse_copy()` 拥有输入副本，`parse_file()` 从文件读取。节点是不拥有资源的句柄，不能比所属文档活得更久。
 
-n.type();        // chyaml::kind
-n.is_mapping();
-n.is_sequence();
-n.is_scalar();
-n.is_null();
-n.key();         // std::string_view
-n.scalar();      // 去掉外层引号，但尚未处理转义
-```
-
-读取到 `std::string_view` 不分配内存，也不展开转义。读取到 `std::string` 会展开写入器使用的常见转义：
+## 多文档
 
 ```cpp
-std::string decoded;
-if (doc.root()["message"].read(decoded)) {
-    // decoded 可包含换行、Tab 等字符
+chyaml::stream_parser stream;
+if (!stream.reset_borrowed(yaml_stream)) return false;
+
+chyaml::document document;
+for (;;) {
+    const auto status = stream.next(document);
+    if (status == chyaml::stream_status::end) break;
+    if (status == chyaml::stream_status::error) return false;
+    // 使用 document，然后读取下一个文档。
 }
 ```
 
-数值转换使用 `std::from_chars`，不会改动全局 locale，也不分配内存。转换必须消费整个标量，否则失败。
+## 写入 YAML 和 JSON
 
-## 写入到字符串
-
-字符串参数始终按字符串加双引号，数值和布尔重载按标量输出。需要自行提供原始标量时使用 `raw()`。
+解析或构造出的文档可写入字符串：
 
 ```cpp
-chyaml::writer out;
+chyaml::emit_options options;
+options.style = chyaml::emit_style::block;
+options.indent = 2;
+options.explicit_document_start = true;
 
-out.begin_mapping();
-out.value("name", "pump-a");
-out.value("rate", 120);
-out.value("enabled", true);
-
-out.begin_sequence("pins");
-out.value(3);
-out.value(5);
-out.end();
-
-out.begin_sequence("peers");
-out.begin_mapping();
-out.value("host", "10.0.0.2");
-out.value("port", 9000);
-out.end();
-out.end();
-
-out.end();
-
-if (!out.complete()) return 1;
-const std::string_view yaml = out.view();
+std::string output;
+if (!document.emit(output, options)) return false;
 ```
 
-结果：
+可用风格包括 `original`、`block`、`flow`、`flow_one_line`、`pretty`、`json`、`json_one_line` 和 `json_type_preserving`。写入器还可保留注释、排序映射键、控制文档标记，并通过 `emit_to_buffer()` 直接写入调用方缓冲区。
 
-```yaml
-name: "pump-a"
-rate: 120
-enabled: true
-pins:
-  - 3
-  - 5
-peers:
-  -
-    host: "10.0.0.2"
-    port: 9000
-```
-
-每个 `begin_mapping()` / `begin_sequence()` 都必须有对应的 `end()`。根节点也需要显式开始和结束。任何调用次序错误或写入失败都会让 `ok()` 变为 `false`。
-
-## 无堆分配写入
-
-`buffer_sink` 将结果直接写到调用者提供的内存，不追加 `\0`。缓冲区不足时，当前及后续操作返回 `false`。
+也可以不经过解析直接构造文档：
 
 ```cpp
-char storage[256];
-using fixed_writer = chyaml::basic_writer<chyaml::buffer_sink, 8>;
-fixed_writer out{chyaml::buffer_sink(storage, sizeof storage)};
+chyaml::document document;
+document.create();
 
-out.begin_mapping();
-out.value("id", 7);
-out.value("state", "ready");
-out.end();
-
-if (out.complete()) {
-    std::string_view yaml = out.view();
-    // 发送 yaml.data(), yaml.size()
-}
+auto root = document.make_mapping();
+auto values = document.make_sequence();
+values.append(document.make_scalar("10"));
+values.append(document.make_scalar("20"));
+root.append(document.make_scalar("values"), values);
+document.set_root(root);
 ```
 
-模板参数 `8` 是这个写入器实例允许的最大容器深度。较小的值能进一步减小对象占用。
+## 性能快照
 
-## 对象序列
+以下结果测于 2026-08-24，环境为 AMD Ryzen 9 9950X、Windows x64、MSVC 19.44 Release。输入包含 50,000 条传感器记录、共 4,627,797 字节。对比吞吐取 9 组交替配对运行的中位数，每组执行 50 次稳态解析。解析器对象及已分配容量均会复用。每个实现运行于独立进程；私有内存基线不包含输入分配。
 
-对象序列中的每一项是一个没有键的映射容器：
+| 模式 | 解析/物化速度 | 观测增量内存 | 输出单元 |
+|---|---:|---:|---:|
+| chyaml 可移植快速事件带 | 约 330 MB/s | 约 6.18 MB（输入的 1.34 倍） | 750,009 个事件 |
+| [rapidyaml 0.16.0](https://github.com/biojppm/rapidyaml/releases/tag/v0.16.0) arena 树，复用 parser/tree | 约 178 MB/s | 约 81.5 MB（输入的 17.61 倍） | 450,003 个节点 |
+| chyaml 完整紧凑事件流 | 约 53 MB/s | 多轮观测为 0–12 KB | 750,009 个事件 |
 
-```cpp
-out.begin_sequence("sensors");
+在这个工作负载中，快速事件带的物化速度约为 rapidyaml arena 树的 1.86 倍，增量内存约小 13.2 倍。快速事件带的遍历速度另行测得约 5,700 万事件/秒。紧凑模式一行来自内置的 10 次迭代基准，其微小内存增量会随操作系统页记账粒度波动。
 
-out.begin_mapping();
-out.value("id", 1);
-out.value("unit", "C");
-out.end();
+这里比较的是不同数据结构：事件带不是可随机访问的 DOM 树。结果只代表此配置型工作负载，不是对所有 YAML 文档、API、编译器或机器的普遍结论。超出快路径范围的输入会使用完整路径，性能也会不同。
 
-out.begin_mapping();
-out.value("id", 2);
-out.value("unit", "%");
-out.end();
+复现内置测量：
 
-out.end();
+```sh
+build/release/chyaml_benchmark events 50000 10
+build/release/chyaml_benchmark events-compact 50000 10
 ```
 
-读取时，序列的每个直属子节点代表一项：
+可选对比目标需要 rapidyaml 0.16.0 源码目录：
 
-```cpp
-auto sensors = doc.root()["sensors"];
-for (std::size_t i = 0; i < sensors.size(); ++i) {
-    auto item = sensors[i];
-    int id = item["id"].value_or(-1);
-    (void)id;
-}
+```sh
+cmake -S . -B build/compare \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCHYAML_BUILD_COMPARISON=ON \
+  -DCHYAML_RAPIDYAML_SOURCE_DIR=/path/to/rapidyaml \
+  -DCHYAML_OPTIMIZE_FOR=SPEED
+cmake --build build/compare -j
+build/compare/chyaml_compare 50000 10
+build/compare/rapidyaml_compare 50000 10
 ```
 
-## 资源与性能说明
+## SIMD 与目标指令优化
 
-- 解析复杂度为 `O(输入字节数)`，没有递归；
-- 每个节点是 20 字节紧凑记录，键和值仍保留在原输入中；
-- `document` 只持有一个节点向量；借用模式不保存输入副本；
-- 按键和按下标访问是当前容器内的线性扫描，不建立哈希表；
-- 解析时的深度栈位于调用栈上，默认最多 32 层；
-- 写入数值使用 `std::to_chars`，不使用 iostream 或 locale；
-- 固定缓冲区写入模式不进行动态内存分配。
+chyaml 快速事件扫描器使用普通标量 C++20，不包含 SSE、AVX、AVX-512、NEON、目标属性、运行时 CPU 分派或架构编译参数。默认 `CHYAML_PORTABLE=ON` 时，完整解析核心的可选 SSE2、SSE4.1、AVX2、AVX-512 和 NEON 目标也会关闭。编译器在正常优化过程中仍可自由使用平台基线指令。
 
-小配置文件通常更受益于紧凑结构和零初始化成本。如果同一个大型映射需要反复随机查询，建议在应用层缓存所需节点，不要重复从根节点查找。
+在 rapidyaml 0.16.0 中，主要 YAML 结构解析器同样是可移植状态机，而不是显式 SIMD 解析器。它捆绑的 c4core 数值转换头文件含有可选 SSE2/NEON 路径，但这不是 YAML 结构扫描的主算法。其性能主要来自原地/arena 字符串、扁平索引树、解析器复用以及非递归状态机。
 
-## 编译期配置
+## CMake 选项
 
-在包含头文件前定义最大解析/默认写入深度：
+| 选项 | 默认值 | 作用 |
+|---|---:|---|
+| `CHYAML_PORTABLE` | `ON` | 关闭依赖中的可选 CPU 专用目标 |
+| `CHYAML_OPTIMIZE_FOR` | `BALANCED` | `SPEED`、`BALANCED` 或 `SIZE` |
+| `CHYAML_ENABLE_IPO` | `ON` | 在工具链支持时启用 IPO/LTO |
+| `CHYAML_USE_SYSTEM_LIBFYAML` | `OFF` | 使用已安装的 libfyaml 0.9.6 包 |
+| `CHYAML_FAST_EVENTS_ONLY` | `OFF` | 只从 `event_parser` 中移除完整回退 |
+| `CHYAML_BUILD_TESTS` | 仅顶层构建开启 | 构建功能测试 |
+| `CHYAML_BUILD_BENCHMARKS` | 仅顶层构建开启 | 构建速度/内存基准 |
+| `CHYAML_BUILD_CONFORMANCE` | 仅顶层构建开启 | 构建 YAML Test Suite 运行器 |
+| `CHYAML_BUILD_COMPARISON` | `OFF` | 构建可选 rapidyaml 对比 |
 
-```cpp
-#define CHYAML_MAX_DEPTH 16
-#include "chyaml.hpp"
+`CHYAML_FAST_EVENTS_ONLY=ON` 是专用部署选项。它会减少事件解析器链接代码，但超出快路径范围的输入将直接报错，不再回退。DOM 与多文档 API 仍使用完整核心。
+
+## 验证
+
+当前测试矩阵覆盖 Release 模式的 MSVC 19.44 和 GCC 12.2。两者均通过功能测试以及固定版本官方 [YAML Test Suite](https://github.com/yaml/yaml-test-suite) 的全部 402 项：接受 308 个有效输入，拒绝 94 个无效输入。
+
+克隆测试数据目录后运行规范测试：
+
+```sh
+build/release/chyaml_conformance /path/to/yaml-test-suite
 ```
 
-值必须大于零。降低它会减小解析临时栈和默认写入器对象；超过限制的输入会返回 `chyaml::error_code::depth_limit`。
+## 许可证
 
-## 错误处理
-
-```cpp
-chyaml::document doc;
-if (!doc.parse(text)) {
-    const chyaml::parse_error e = doc.error();
-    std::string_view reason = chyaml::message(e.code);
-    // e.line 和 e.column 从 1 开始；全局大小错误可能为 0
-}
-```
-
-解析失败后，错误位置之前的节点可能仍保留在文档中，只应用于诊断，不应当作完整配置使用。重新调用 `parse()`、`parse_copy()` 或 `clear()` 即可复用对象。
-
-## 建议
-
-- 对可信配置优先使用 `parse()`；
-- 已知节点数量时先调用 `reserve()`，可避免节点向量扩容；
-- 配置生成端优先使用本库写入器，可确保落在受支持子集内；
-- 对来自不可信来源的配置，在业务层继续检查字段范围、必填项和序列长度。
+chyaml 使用 MIT 许可证。完整解析依赖的声明见 `THIRD_PARTY_NOTICES.md`。rapidyaml 只用于可选的本地对比目标，不属于 chyaml 生产库。

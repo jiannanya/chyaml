@@ -57,8 +57,8 @@ std::string make_input(std::size_t records) {
 
 int main(int argc, char** argv) {
     const std::string_view profile = argc > 1 ? std::string_view(argv[1]) : "fast";
-    const bool compact = profile == "compact";
-    const bool event_mode = profile == "events";
+    const bool compact = profile == "compact" || profile == "events-compact";
+    const bool event_mode = profile == "events" || profile == "events-compact";
     const std::size_t records = argc > 2
         ? static_cast<std::size_t>(std::strtoull(argv[2], nullptr, 10)) : 50000;
     const int iterations = argc > 3 ? std::atoi(argv[3]) : 5;
@@ -70,6 +70,7 @@ int main(int argc, char** argv) {
     const std::size_t memory_before = private_memory_bytes();
     std::size_t peak_memory = memory_before;
     std::size_t retained_event_count = 0;
+    double event_traversal_seconds = 0.0;
     std::string output;
     double emit_seconds = 0.0;
     {
@@ -77,12 +78,17 @@ int main(int argc, char** argv) {
         chyaml::event_parser retained_events;
         if (event_mode) {
             if (!retained_events.reset_borrowed(input, options)) return 1;
+            peak_memory = (std::max)(peak_memory, private_memory_bytes());
             chyaml::event event;
+            const auto traversal_start = std::chrono::steady_clock::now();
             while (retained_events.next(event) == chyaml::event_status::event) {
                 ++retained_event_count;
                 if ((retained_event_count & 1023U) == 0U)
                     peak_memory = (std::max)(peak_memory, private_memory_bytes());
             }
+            const auto traversal_stop = std::chrono::steady_clock::now();
+            event_traversal_seconds =
+                std::chrono::duration<double>(traversal_stop - traversal_start).count();
             if (retained_events.error()) return 1;
             peak_memory = (std::max)(peak_memory, private_memory_bytes());
         } else {
@@ -96,9 +102,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    bool buffered_events = false;
     if (event_mode) {
         chyaml::event_parser warmup;
         if (!warmup.reset_borrowed(input, options)) return 1;
+        buffered_events = warmup.buffered();
         chyaml::event event;
         while (warmup.next(event) == chyaml::event_status::event) {}
         if (warmup.error()) return 1;
@@ -111,14 +119,18 @@ int main(int argc, char** argv) {
     }
 
     const auto start = std::chrono::steady_clock::now();
-    for (int i = 0; i < iterations; ++i) {
-        if (event_mode) {
-            chyaml::event_parser parser;
+    if (event_mode) {
+        chyaml::event_parser parser;
+        for (int i = 0; i < iterations; ++i) {
             if (!parser.reset_borrowed(input, options)) return 1;
-            chyaml::event event;
-            while (parser.next(event) == chyaml::event_status::event) {}
-            if (parser.error()) return 1;
-        } else {
+            if (!buffered_events) {
+                chyaml::event event;
+                while (parser.next(event) == chyaml::event_status::event) {}
+                if (parser.error()) return 1;
+            }
+        }
+    } else {
+        for (int i = 0; i < iterations; ++i) {
             chyaml::document document;
             if (!document.parse_borrowed(input, options)) return 1;
         }
@@ -140,6 +152,12 @@ int main(int argc, char** argv) {
               << "memory/input ratio: "
               << static_cast<double>(memory_delta) / input.size() << '\n'
               << "events: " << retained_event_count << '\n';
+    if (event_mode) {
+        std::cout << "buffered events: " << (buffered_events ? "yes" : "no") << '\n'
+                  << "event traversal million events/s: "
+                  << static_cast<double>(retained_event_count) / 1e6 /
+                         event_traversal_seconds << '\n';
+    }
     if (!event_mode) {
         std::cout << "emit MB/s: "
                   << (static_cast<double>(output.size()) / (1024.0 * 1024.0) / emit_seconds) << '\n'
