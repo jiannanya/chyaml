@@ -166,6 +166,35 @@ about 110 KB versus about 127 KB for the comparison tree API. These structures
 serve different access patterns, so the numbers describe this workload and do
 not imply identical semantics or universal performance.
 
+The original workload above remains the built-in single-workload benchmark. A
+second suite covers eight input shapes. The following results use the same
+machine and toolchain, with 9 alternating paired runs per scenario and 15
+steady-state parses per process sample. Every sample starts a fresh process;
+both executables compile the same shared input generators.
+
+| Workload | Input MiB | chyaml MB/s | rapidyaml MB/s | Speed ratio | chyaml memory MiB | rapidyaml memory MiB | Memory ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Mixed records | 4.41 | 396.1 | 184.9 | 2.14x | 5.90 | 77.15 | 13.07x |
+| Flat mapping | 4.77 | 682.7 | 316.1 | 2.16x | 6.37 | 42.01 | 6.59x |
+| Scalar sequence | 6.82 | 882.6 | 458.5 | 1.92x | 9.11 | 44.05 | 4.84x |
+| Nested mappings | 3.27 | 316.4 | 272.8 | 1.16x | 4.38 | 39.92 | 9.12x |
+| Flow sequences | 5.14 | 310.0 | 152.7 | 2.03x | 10.31 | 150.01 | 14.55x |
+| Quoted strings | 6.50 | 1436.1 | 733.2 | 1.96x | 8.69 | 25.71 | 2.96x |
+| Sparse values/comments | 7.81 | 638.9 | 314.3 | 2.03x | 10.44 | 81.12 | 7.77x |
+| Long scalars | 4.79 | 1549.0 | 772.6 | 2.00x | 6.40 | 10.46 | 1.63x |
+
+Across the whole matrix, byte-weighted aggregate throughput is 599.2 MB/s for
+chyaml and 312.2 MB/s for rapidyaml, a 1.92x ratio. The per-workload speed-ratio
+geometric mean is 1.90x; the incremental-memory-ratio geometric mean is 6.16x
+in chyaml's favor. The matrix intentionally reports the weakest result too:
+nested mappings show a 1.16x speed ratio.
+
+These performance scenarios target the portable 8-byte fast event tape. Full
+YAML grammar coverage is tested separately by the 402-case conformance suite;
+small heterogeneous conformance fixtures are not presented as throughput
+measurements. Memory is the observed private-memory increase from the
+post-input baseline through the warm parse, not a process-wide peak.
+
 Reproduce the built-in test:
 
 ```sh
@@ -184,6 +213,29 @@ cmake --build build/compare --config Release -j
 build/compare/Release/chyaml_compare 50000 25
 build/compare/Release/rapidyaml_compare 50000 25
 ```
+
+The numeric form above is retained for the original single workload. List and
+run an individual added scenario with:
+
+```sh
+build/compare/Release/chyaml_compare --list
+build/compare/Release/chyaml_compare nested_maps 0 25
+build/compare/Release/rapidyaml_compare nested_maps 0 25
+```
+
+Run the isolated paired suite and print both the per-workload table and
+aggregate statistics with:
+
+```sh
+python tests/run_comparison.py \
+  --chyaml build/compare/Release/chyaml_compare.exe \
+  --rapidyaml build/compare/Release/rapidyaml_compare.exe \
+  --runs 9 --iterations 15
+```
+
+When Python 3 is found during configuration, the
+`chyaml_comparison_suite` build target runs the same driver with its shorter
+7-run default.
 
 ## SIMD note
 

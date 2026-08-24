@@ -1,4 +1,5 @@
 #include "chyaml.hpp"
+#include "benchmark_scenarios.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -10,7 +11,9 @@
 #include <string_view>
 
 #if defined(_WIN32)
-#  define NOMINMAX
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
 #  include <windows.h>
 #  include <psapi.h>
 #elif defined(__linux__)
@@ -38,21 +41,6 @@ std::size_t private_memory_bytes() {
     return 0;
 }
 
-std::string make_input(std::size_t records) {
-    std::string yaml;
-    yaml.reserve(records * 128);
-    yaml += "---\nrecords:\n";
-    for (std::size_t i = 0; i < records; ++i) {
-        yaml += "  - id: ";
-        yaml += std::to_string(i);
-        yaml += "\n    name: \"sensor-";
-        yaml += std::to_string(i);
-        yaml += "\"\n    enabled: true\n    samples: [1.25, 2.5, 5.0, 10.0]\n";
-    }
-    yaml += "...\n";
-    return yaml;
-}
-
 } // namespace
 
 int main(int argc, char** argv) {
@@ -63,7 +51,7 @@ int main(int argc, char** argv) {
         ? static_cast<std::size_t>(std::strtoull(argv[2], nullptr, 10)) : 50000;
     const int iterations = argc > 3 ? std::atoi(argv[3]) : 5;
 
-    const std::string input = make_input(records);
+    const std::string input = chyaml_bench::make_mixed_records(records);
     chyaml::parse_options options;
     options.profile = compact ? chyaml::parse_profile::compact : chyaml::parse_profile::fast;
 

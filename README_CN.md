@@ -131,6 +131,23 @@ if (!doc.emit(output, options)) return false;
 
 在该工作负载上，chyaml 事件带约快 2.13 倍，增量内存约小 13.18 倍。Release 链接空间探针中，完整 chyaml DOM API 约 110 KB，对比树 API 约 127 KB。两者的数据结构和访问模式不同，因此这些结果描述的是该工作负载，不代表语义完全相同或所有输入上的普遍性能。
 
+上述原始负载继续作为内置单一工作负载基准保留。新增的第二套测试覆盖 8 种输入形态。下表仍使用相同机器和工具链；每个场景执行 9 组交替配对运行，每个进程样本进行 15 次稳态解析。每个样本都启动新进程，两个可执行文件编译并使用同一份共享输入生成器。
+
+| 工作负载 | 输入 MiB | chyaml MB/s | rapidyaml MB/s | 速度比 | chyaml 内存 MiB | rapidyaml 内存 MiB | 内存比 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 混合记录 | 4.41 | 396.1 | 184.9 | 2.14x | 5.90 | 77.15 | 13.07x |
+| 扁平映射 | 4.77 | 682.7 | 316.1 | 2.16x | 6.37 | 42.01 | 6.59x |
+| 标量序列 | 6.82 | 882.6 | 458.5 | 1.92x | 9.11 | 44.05 | 4.84x |
+| 嵌套映射 | 3.27 | 316.4 | 272.8 | 1.16x | 4.38 | 39.92 | 9.12x |
+| 流式序列 | 5.14 | 310.0 | 152.7 | 2.03x | 10.31 | 150.01 | 14.55x |
+| 引号字符串 | 6.50 | 1436.1 | 733.2 | 1.96x | 8.69 | 25.71 | 2.96x |
+| 稀疏值/注释 | 7.81 | 638.9 | 314.3 | 2.03x | 10.44 | 81.12 | 7.77x |
+| 长标量 | 4.79 | 1549.0 | 772.6 | 2.00x | 6.40 | 10.46 | 1.63x |
+
+整个矩阵按输入字节加权后的综合吞吐为 chyaml 599.2 MB/s、rapidyaml 312.2 MB/s，速度比 1.92 倍。各工作负载速度比的几何平均值为 1.90 倍，增量内存比的几何平均值为 chyaml 小 6.16 倍。矩阵也明确保留最弱结果：嵌套映射的速度比为 1.16 倍。
+
+这些性能场景针对可移植 8 字节快速事件带。完整 YAML 语法由独立的 402 项规范套件验证；体积很小且差异很大的规范样例不被包装成吞吐数据。内存值是从输入生成完成后的基线到预热解析后的观测私有内存增量，不是进程全生命周期峰值。
+
 复现内置基准：
 
 ```sh
@@ -148,6 +165,25 @@ cmake --build build/compare --config Release -j
 build/compare/Release/chyaml_compare 50000 25
 build/compare/Release/rapidyaml_compare 50000 25
 ```
+
+以上数字参数形式继续用于原来的单一工作负载。列出并单独运行新增场景：
+
+```sh
+build/compare/Release/chyaml_compare --list
+build/compare/Release/chyaml_compare nested_maps 0 25
+build/compare/Release/rapidyaml_compare nested_maps 0 25
+```
+
+用独立进程运行交替配对综合套件，并打印逐场景表格与综合统计：
+
+```sh
+python tests/run_comparison.py \
+  --chyaml build/compare/Release/chyaml_compare.exe \
+  --rapidyaml build/compare/Release/rapidyaml_compare.exe \
+  --runs 9 --iterations 15
+```
+
+配置阶段找到 Python 3 时，还会提供 `chyaml_comparison_suite` 构建目标，以较短的默认 7 组运行执行同一驱动器。
 
 ## SIMD 说明
 

@@ -153,6 +153,20 @@ if(CHYAML_BUILD_COMPARISON)
         target_link_libraries(rapidyaml_compare PRIVATE psapi)
     endif()
 
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_custom_target(chyaml_comparison_suite
+            COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_comparison.py"
+                --chyaml $<TARGET_FILE:chyaml_compare>
+                --rapidyaml $<TARGET_FILE:rapidyaml_compare>
+                --runs 7
+                --iterations 10
+            DEPENDS chyaml_compare rapidyaml_compare
+            USES_TERMINAL
+            VERBATIM)
+    endif()
+
     add_executable(rapidyaml_size_probe tests/rapidyaml_size_probe.cpp)
     target_link_libraries(rapidyaml_size_probe PRIVATE ryml::ryml)
     target_compile_features(rapidyaml_size_probe PRIVATE cxx_std_20)
