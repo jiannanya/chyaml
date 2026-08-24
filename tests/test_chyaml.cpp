@@ -1,130 +1,167 @@
-#include "../chyaml.hpp"
+#include "chyaml.hpp"
 
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <cmath>
-#include <fstream>
-#include <iostream>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
-int main(int argc, char** argv) {
-    constexpr std::string_view source = R"(---
-# device configuration
-device:
-  name: "pump\nA" # escaped name
-  rate: 12.5
+int main() {
+    static_assert(chyaml::specification_version == "1.2.2");
+
+    constexpr std::string_view source = R"(%YAML 1.2
+%TAG !e! tag:example.com,2026:
+---
+# retained document comment
+defaults: &defaults
   enabled: true
-  empty: null
-  pins:
-    - 3
-    - 5
-  peers:
-    - host: "10.0.0.2"
-      port: 9000
-    - host: 'edge-2'
-      port: 9001
+  literal: |-
+    line one
+    line two
+  folded: >
+    folded
+    text
+flow: {numbers: [1, 16, 3.5], quoted: "A\u263A"}
+copy: *defaults
+tagged: !e!sensor value
+? [blue, red]
+: complex-key
 ...
 )";
 
-    chyaml::document doc;
-    assert(doc.parse(source));
-    assert(!doc.owns_source());
-    assert(doc.root().is_mapping());
+    chyaml::parse_options parse_options;
+    parse_options.preserve_comments = true;
 
-    const auto device = doc.root()["device"];
-    assert(device.is_mapping());
-    assert(device["enabled"].value_or(false));
-    assert(std::fabs(device["rate"].value_or(0.0) - 12.5) < 0.0001);
-    assert(device["empty"].is_null());
+    chyaml::document document;
+    assert(document.parse_borrowed(source, parse_options));
+    assert(document);
 
-    std::string name;
-    assert(device["name"].read(name));
-    assert(name == "pump\nA");
+    const auto root = document.root();
+    assert(root.is_mapping());
+    assert(root.size() == 5);
 
-    const auto pins = device["pins"];
-    assert(pins.is_sequence());
-    assert(pins.size() == 2);
-    assert(pins[0].value_or(-1) == 3);
-    assert(pins[1].value_or(-1) == 5);
+    const auto defaults = root["defaults"];
+    assert(defaults.is_mapping());
+    assert(defaults.anchor() == "defaults");
+    assert(defaults["literal"].style() == chyaml::node_style::literal);
+    assert(defaults["literal"].scalar() == "line one\nline two");
+    assert(defaults["folded"].style() == chyaml::node_style::folded);
+    assert(defaults["folded"].scalar() == "folded text\n");
 
-    const auto peers = device["peers"];
-    assert(peers.is_sequence());
-    assert(peers.size() == 2);
-    assert(peers[0].is_mapping());
-    assert(peers[0]["host"].value_or<std::string_view>({}) == "10.0.0.2");
-    assert(peers[1]["port"].value_or(0) == 9001);
+    bool enabled = false;
+    assert(defaults["enabled"].as_bool(enabled));
+    assert(enabled);
 
-    chyaml::writer dynamic;
-    assert(dynamic.begin_mapping());
-    assert(dynamic.value("name", "pump-a"));
-    assert(dynamic.value("rate", 120));
-    assert(dynamic.value("enabled", true));
-    assert(dynamic.begin_sequence("pins"));
-    assert(dynamic.value(3));
-    assert(dynamic.value(5));
-    assert(dynamic.end());
-    assert(dynamic.begin_sequence("peers"));
-    assert(dynamic.begin_mapping());
-    assert(dynamic.value("host", "10.0.0.2"));
-    assert(dynamic.value("port", 9000));
-    assert(dynamic.end());
-    assert(dynamic.end());
-    assert(dynamic.end());
-    assert(dynamic.complete());
+    const auto numbers = root.by_path("flow/numbers");
+    assert(numbers.is_sequence());
+    assert(numbers.style() == chyaml::node_style::flow);
+    assert(numbers.size() == 3);
 
-    chyaml::document generated;
-    assert(generated.parse(dynamic.view()));
-    assert(generated.root()["pins"][1].value_or(-1) == 5);
-    assert(generated.root()["peers"][0]["port"].value_or(0) == 9000);
+    std::int64_t integer = 0;
+    double real = 0.0;
+    assert(numbers[0].as_int64(integer) && integer == 1);
+    assert(numbers[2].as_double(real) && std::fabs(real - 3.5) < 0.000001);
+    assert(root.by_path("flow/quoted").scalar() == "A\xE2\x98\xBA");
 
-    char storage[128];
-    using fixed_writer = chyaml::basic_writer<chyaml::buffer_sink, 8>;
-    fixed_writer fixed{chyaml::buffer_sink(storage, sizeof storage)};
-    assert(fixed.begin_mapping());
-    assert(fixed.value("id", 7));
-    assert(fixed.value("state", "ready"));
-    assert(fixed.end());
-    assert(fixed.complete());
+    const auto alias = root["copy"];
+    assert(alias.is_alias());
+    assert(alias.resolve_alias().native_handle() == defaults.native_handle());
 
-    chyaml::document copied;
-    assert(copied.parse_copy(fixed.view()));
-    assert(copied.owns_source());
-    assert(copied.root()["id"].value_or(0) == 7);
+    const auto tagged = root["tagged"];
+    assert(tagged.scalar() == "value");
+    assert(!tagged.tag().empty());
 
-    chyaml::document invalid;
-    assert(!invalid.parse("key: |\n  text\n"));
-    assert(invalid.error().code == chyaml::error_code::unsupported_multiline_scalar);
+    const auto complex_value = root.find_yaml_key("[blue, red]");
+    assert(complex_value.scalar() == "complex-key");
+    const auto complex_pair = root.pair_at(-1);
+    assert(complex_pair);
+    assert(complex_pair.key.is_sequence());
 
-    assert(!invalid.parse("map:\n  key: value\n  - mixed\n"));
-    assert(invalid.error().code == chyaml::error_code::mixed_container);
-
-    assert(!invalid.parse("value:\n\tkey: 1\n"));
-    assert(invalid.error().code == chyaml::error_code::tab_indentation);
-
-    chyaml::document moved = std::move(copied);
-    assert(moved.owns_source());
-    assert(moved.root()["state"].value_or<std::string_view>({}) == "ready");
-
-    assert(!chyaml::node{}.is_null());
-
-    chyaml::document common;
-    assert(common.parse("title: YAML Ain't Markup\nitems:\n- one\n- two\n"));
-    assert(common.root()["title"].value_or<std::string_view>({}) == "YAML Ain't Markup");
-    assert(common.root()["items"].is_sequence());
-    assert(common.root()["items"].size() == 2);
-
-    for (int i = 1; i < argc; ++i) {
-        std::ifstream input(argv[i], std::ios::binary);
-        std::string data((std::istreambuf_iterator<char>(input)),
-                         std::istreambuf_iterator<char>());
-        chyaml::document file;
-        if (!file.parse(data)) {
-            const auto error = file.error();
-            std::cerr << argv[i] << ':' << error.line << ':' << error.column
-                      << ": " << chyaml::message(error.code) << '\n';
-            return 2;
+    chyaml::event_parser events;
+    assert(events.reset_borrowed(source));
+    chyaml::event parsed_event;
+    std::size_t event_count = 0;
+    std::size_t alias_count = 0;
+    for (;;) {
+        const auto status = events.next(parsed_event);
+        if (status == chyaml::event_status::end) break;
+        assert(status == chyaml::event_status::event);
+        ++event_count;
+        if (parsed_event.type == chyaml::event_type::alias) {
+            ++alias_count;
+            assert(parsed_event.value == "defaults");
         }
     }
+    assert(event_count > 20);
+    assert(alias_count == 1);
+
+    chyaml::emit_options emit_options;
+    emit_options.output_comments = true;
+    emit_options.explicit_document_start = true;
+    std::string emitted;
+    assert(document.emit(emitted, emit_options));
+    assert(emitted.find("retained document comment") != std::string::npos);
+
+    chyaml::document reparsed;
+    assert(reparsed.parse_copy(emitted, parse_options));
+    assert(reparsed.root().find_yaml_key("[blue, red]").scalar() == "complex-key");
+
+    char fixed[4096];
+    std::size_t written = 0;
+    assert(document.emit_to_buffer(fixed, sizeof fixed, written, emit_options));
+    assert(written != 0 && written < sizeof fixed);
+
+    constexpr std::string_view stream_text = R"(---
+name: first
+...
+---
+- second
+- document
+...
+)";
+    chyaml::stream_parser stream;
+    assert(stream.reset_copy(stream_text));
+    chyaml::document first;
+    chyaml::document second;
+    assert(stream.next(first) == chyaml::stream_status::document);
+    assert(first.root()["name"].scalar() == "first");
+    assert(stream.next(second) == chyaml::stream_status::document);
+    assert(second.root().is_sequence() && second.root().size() == 2);
+    assert(stream.next(first) == chyaml::stream_status::end);
+
+    chyaml::document built;
+    assert(built.create());
+    auto built_root = built.make_mapping();
+    auto key_name = built.make_scalar("name");
+    auto value_name = built.make_scalar("sensor-a");
+    auto key_values = built.make_scalar("values");
+    auto values = built.make_sequence();
+    assert(built_root && key_name && value_name && key_values && values);
+    assert(values.append(built.make_scalar("10")));
+    assert(values.append(built.make_scalar("20")));
+    assert(built_root.append(key_name, value_name));
+    assert(built_root.append(key_values, values));
+    assert(built.set_root(built_root));
+    assert(built.root()["values"].size() == 2);
+
+    chyaml::emit_options json_options;
+    json_options.style = chyaml::emit_style::json_one_line;
+    const std::string json = built.emit(json_options);
+    assert(json.find("sensor-a") != std::string::npos);
+
+    chyaml::document invalid;
+    assert(!invalid.parse_borrowed("key: [unterminated\n"));
+    assert(invalid.error());
+
+    chyaml::stream_parser invalid_stream;
+    assert(invalid_stream.reset_borrowed("---\nvalid: true\n---\ninvalid: [\n"));
+    chyaml::document streamed;
+    assert(invalid_stream.next(streamed) == chyaml::stream_status::document);
+    assert(invalid_stream.next(streamed) == chyaml::stream_status::error);
+    assert(invalid_stream.error());
 
     return 0;
 }

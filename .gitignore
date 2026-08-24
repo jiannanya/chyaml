@@ -1,0 +1,8 @@
+/build/
+/.cache/
+*.user
+*.obj
+*.pdb
+*.ilk
+*.exe
+
