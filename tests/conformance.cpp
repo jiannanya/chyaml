@@ -60,8 +60,8 @@ int main(int argc, char** argv) {
 
         if (observed_error == should_fail) {
             ++passed;
-        } else if (failures.size() < 32) {
-            std::string failure = entry.path().parent_path().filename().string();
+        } else if (failures.size() < 512) {
+            std::string failure = fs::relative(entry.path().parent_path(), root).generic_string();
             failure += should_fail ? ": invalid input was accepted" : ": valid input was rejected";
             if (!should_fail && parser.error()) {
                 failure += " at " + std::to_string(parser.error().line) + ':' +

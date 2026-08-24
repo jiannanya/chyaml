@@ -1,8 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(chyaml VERSION 2.0.0 LANGUAGES C CXX)
+project(chyaml VERSION 2.0.0 LANGUAGES CXX)
 
-include(FetchContent)
 include(CheckIPOSupported)
 
 set(CHYAML_STANDALONE OFF)
@@ -15,53 +14,10 @@ option(CHYAML_BUILD_BENCHMARKS "Build performance and memory benchmark" ${CHYAML
 option(CHYAML_BUILD_CONFORMANCE "Build the YAML Test Suite acceptance runner" ${CHYAML_STANDALONE})
 option(CHYAML_BUILD_SIZE_PROBE "Build the minimum linked-size probe" ${CHYAML_STANDALONE})
 option(CHYAML_BUILD_COMPARISON "Build the optional rapidyaml comparison benchmark" OFF)
-option(CHYAML_USE_SYSTEM_LIBFYAML "Use an installed libfyaml package" OFF)
 option(CHYAML_ENABLE_IPO "Enable interprocedural optimization in release builds" ON)
-option(CHYAML_PORTABLE "Disable dependency CPU-specific SIMD targets" ON)
-option(CHYAML_FAST_EVENTS_ONLY "Omit the full-standard fallback from event_parser" OFF)
 set(CHYAML_RAPIDYAML_SOURCE_DIR "" CACHE PATH "Path to a rapidyaml source tree for comparison")
 set(CHYAML_OPTIMIZE_FOR "BALANCED" CACHE STRING "Optimization profile: SPEED, BALANCED, or SIZE")
 set_property(CACHE CHYAML_OPTIMIZE_FOR PROPERTY STRINGS SPEED BALANCED SIZE)
-
-if(CHYAML_USE_SYSTEM_LIBFYAML)
-    find_package(libfyaml 0.9.6 CONFIG REQUIRED)
-else()
-    function(chyaml_add_bundled_core)
-        set(BUILD_SHARED_LIBS OFF)
-        set(BUILD_TESTING OFF)
-        set(ENABLE_NETWORK OFF)
-        set(ENABLE_LIBCLANG OFF)
-        set(ENABLE_PORTABLE_TARGET ${CHYAML_PORTABLE})
-
-        FetchContent_Declare(
-            libfyaml
-            GIT_REPOSITORY https://github.com/pantoniou/libfyaml.git
-            GIT_TAG 1ed9bae3b1e5fc57e31a14a2ea12810fdf423473
-            GIT_SHALLOW TRUE
-            GIT_PROGRESS TRUE
-        )
-        FetchContent_GetProperties(libfyaml)
-        if(NOT libfyaml_POPULATED)
-            if(POLICY CMP0169)
-                cmake_policy(SET CMP0169 OLD)
-            endif()
-            FetchContent_Populate(libfyaml)
-            add_subdirectory(
-                "${libfyaml_SOURCE_DIR}"
-                "${libfyaml_BINARY_DIR}"
-                EXCLUDE_FROM_ALL)
-        endif()
-    endfunction()
-    chyaml_add_bundled_core()
-
-    foreach(unused_target fyaml_static fy-tool fy-thread fy-b3sum fy-allocators)
-        if(TARGET ${unused_target})
-            set_target_properties(${unused_target} PROPERTIES
-                EXCLUDE_FROM_ALL TRUE
-                EXCLUDE_FROM_DEFAULT_BUILD TRUE)
-        endif()
-    endforeach()
-endif()
 
 add_library(chyaml STATIC chyaml.cpp)
 add_library(chyaml::chyaml ALIAS chyaml)
@@ -69,10 +25,6 @@ add_library(chyaml::chyaml ALIAS chyaml)
 target_compile_features(chyaml PUBLIC cxx_std_20)
 target_include_directories(chyaml
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(chyaml PRIVATE libfyaml::libfyaml)
-if(CHYAML_FAST_EVENTS_ONLY)
-    target_compile_definitions(chyaml PRIVATE CHYAML_FAST_EVENTS_ONLY=1)
-endif()
 
 set_target_properties(chyaml PROPERTIES
     CXX_EXTENSIONS OFF
@@ -85,9 +37,6 @@ if(NOT CHYAML_OPTIMIZE_FOR_UPPER MATCHES "^(SPEED|BALANCED|SIZE)$")
 endif()
 
 set(CHYAML_OPTIMIZED_TARGETS chyaml)
-if(TARGET fyaml)
-    list(APPEND CHYAML_OPTIMIZED_TARGETS fyaml)
-endif()
 
 foreach(target_name IN LISTS CHYAML_OPTIMIZED_TARGETS)
     if(MSVC)
