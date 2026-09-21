@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 int main() {
     static_assert(chyaml::specification_version == "1.2.2");
@@ -201,12 +202,228 @@ name: first
     assert(!invalid.parse_borrowed("key: [unterminated\n"));
     assert(invalid.error());
 
+    // Wide collections exercise the regular-stride fast path taken by at() and
+    // pair_at(), which locates the k-th child arithmetically instead of walking
+    // the sibling chain. Each shape below lands on a different branch.
+    {
+        constexpr int wide_count = 3000;
+        constexpr int list_count = 2500;
+
+        std::string wide;
+        wide.reserve(wide_count * 24 + list_count * 16 + 64);
+        wide += "---\n";
+        for (int i = 0; i < wide_count; ++i) {
+            wide += "key_";
+            wide += std::to_string(i);
+            wide += ": value_";
+            wide += std::to_string(i);
+            wide += "\n";
+        }
+        wide += "...\n";
+
+        chyaml::document flat;
+        assert(flat.parse_borrowed(wide));
+        const auto flat_root = flat.root();
+        assert(flat_root.is_mapping());
+        assert(flat_root.size() == static_cast<std::size_t>(wide_count));
+        // Sequential and random access must agree with the sibling walk.
+        for (int i = 0; i < wide_count; ++i) {
+            assert(flat_root.at(i).scalar() == "value_" + std::to_string(i));
+        }
+        for (int i : {0, 1, 17, wide_count / 2, wide_count - 2, wide_count - 1}) {
+            const auto entry = flat_root.pair_at(i);
+            assert(entry);
+            assert(entry.key.scalar() == "key_" + std::to_string(i));
+            assert(entry.value.scalar() == "value_" + std::to_string(i));
+        }
+        assert(flat_root.pair_at(-1).key.scalar() == "key_" + std::to_string(wide_count - 1));
+        assert(!flat_root.at(wide_count));
+        assert(!flat_root.pair_at(wide_count));
+        assert(flat_root.find("key_1234").scalar() == "value_1234");
+        assert(flat_root.by_path("key_7").scalar() == "value_7");
+
+        std::string listed;
+        listed.reserve(list_count * 16 + 16);
+        listed += "---\n";
+        for (int i = 0; i < list_count; ++i) {
+            listed += "- item_";
+            listed += std::to_string(i);
+            listed += "\n";
+        }
+        listed += "...\n";
+
+        chyaml::document sequence;
+        assert(sequence.parse_borrowed(listed));
+        const auto sequence_root = sequence.root();
+        assert(sequence_root.is_sequence());
+        assert(sequence_root.size() == static_cast<std::size_t>(list_count));
+        for (int i = 0; i < list_count; ++i)
+            assert(sequence_root.at(i).scalar() == "item_" + std::to_string(i));
+        assert(sequence_root.at(-1).scalar() == "item_" + std::to_string(list_count - 1));
+        assert(sequence_root.by_path("1999").scalar() == "item_1999");
+
+        // Irregular child spacing must fall back to the sibling walk without
+        // changing any observable result.
+        constexpr std::string_view irregular = R"(---
+first: 1
+second:
+  nested_a: x
+  nested_b: y
+third: 3
+fourth:
+  - a
+  - b
+fifth: 5
+)";
+        chyaml::document uneven;
+        assert(uneven.parse_borrowed(irregular));
+        const auto uneven_root = uneven.root();
+        assert(uneven_root.size() == 5);
+        assert(uneven_root.at(0).scalar() == "1");
+        assert(uneven_root.at(2).scalar() == "3");
+        assert(uneven_root.at(4).scalar() == "5");
+        assert(uneven_root.pair_at(1).key.scalar() == "second");
+        assert(uneven_root.pair_at(3).key.scalar() == "fourth");
+        assert(uneven_root.at(-1).scalar() == "5");
+
+        // Appending invalidates any cached stride hint; reads must stay correct.
+        assert(sequence.root().append(sequence.make_scalar("appended")));
+        assert(sequence.root().size() == static_cast<std::size_t>(list_count) + 1);
+        assert(sequence.root().at(list_count).scalar() == "appended");
+        assert(sequence.root().at(list_count - 1).scalar() ==
+               "item_" + std::to_string(list_count - 1));
+    }
+
     chyaml::stream_parser invalid_stream;
     assert(invalid_stream.reset_borrowed("---\nvalid: true\n---\ninvalid: [\n"));
     chyaml::document streamed;
     assert(invalid_stream.next(streamed) == chyaml::stream_status::document);
     assert(invalid_stream.next(streamed) == chyaml::stream_status::error);
     assert(invalid_stream.error());
+
+    // Parallel multi-document parsing must reproduce the sequential documents,
+    // scalar content, and error positions byte for byte, including when the
+    // splitter refuses the stream and the caller falls back.
+    {
+        const auto make_stream = [](int documents, bool quoted, bool broken) {
+            std::string text;
+            text.reserve(static_cast<std::size_t>(documents) * 1400 + 64);
+            for (int i = 0; i < documents; ++i) {
+                text += "---\nid: doc_";
+                text += std::to_string(i);
+                text += "\nvalue: ";
+                if (quoted) text += '"';
+                text += std::to_string(i * 7919);
+                if (quoted) text += '"';
+                text += "\nitems:\n";
+                for (int j = 0; j < 40; ++j) {
+                    text += "  - item_";
+                    text += std::to_string(i);
+                    text += '_';
+                    text += std::to_string(j);
+                    text += '\n';
+                }
+                text += "...\n";
+            }
+            if (broken) text += "---\nbad: [unterminated\n";
+            return text;
+        };
+
+        struct collected {
+            std::vector<std::string> documents{};
+            chyaml::parse_error error{};
+        };
+        const auto collect_stream = [](std::string_view text,
+                                       const chyaml::parse_options& options) {
+            collected result;
+            chyaml::stream_parser parser;
+            if (!parser.reset_borrowed(text, options)) {
+                result.error = parser.error();
+                return result;
+            }
+            chyaml::document current;
+            for (;;) {
+                const auto status = parser.next(current);
+                if (status == chyaml::stream_status::end) break;
+                if (status == chyaml::stream_status::error) break;
+                std::string rendered;
+                assert(current.emit(rendered));
+                result.documents.push_back(std::move(rendered));
+            }
+            result.error = parser.error();
+            return result;
+        };
+
+        const auto same_result = [](const collected& left, const collected& right) {
+            if (left.documents != right.documents) return false;
+            if (left.error.message != right.error.message ||
+                left.error.line != right.error.line ||
+                left.error.column != right.error.column) return false;
+            return true;
+        };
+
+        chyaml::parse_options parallel;
+        parallel.parallel_documents = true;
+        chyaml::parse_options single_worker = parallel;
+        single_worker.max_worker_threads = 1;
+        chyaml::parse_options two_workers = parallel;
+        two_workers.max_worker_threads = 2;
+
+        // Plain scalars only: the splitter accepts and the chunks run on the
+        // worker pool. The stream is far wider than one chunk, so several
+        // document boundaries are grouped per chunk.
+        const std::string plain_stream = make_stream(420, false, false);
+        assert(plain_stream.size() > 256U * 1024U);
+        const auto sequential = collect_stream(plain_stream, {});
+        assert(sequential.documents.size() == 420);
+        assert(!sequential.error);
+        assert(same_result(sequential, collect_stream(plain_stream, parallel)));
+        assert(same_result(sequential, collect_stream(plain_stream, single_worker)));
+        assert(same_result(sequential, collect_stream(plain_stream, two_workers)));
+
+        // Quoted scalars make the splitter refuse; the sequential fallback must
+        // still produce the identical documents.
+        const std::string quoted_stream = make_stream(420, true, false);
+        const auto quoted_sequential = collect_stream(quoted_stream, {});
+        assert(quoted_sequential.documents.size() == 420);
+        assert(same_result(quoted_sequential, collect_stream(quoted_stream, parallel)));
+
+        // A broken trailing document forces the chunk pool to abandon its work
+        // and the sequential pass to report the authoritative position.
+        const std::string broken_stream = make_stream(420, false, true);
+        const auto broken_sequential = collect_stream(broken_stream, {});
+        assert(broken_sequential.error);
+        const auto broken_parallel = collect_stream(broken_stream, parallel);
+        assert(broken_parallel.error);
+        assert(broken_parallel.error.line == broken_sequential.error.line);
+        assert(broken_parallel.error.column == broken_sequential.error.column);
+
+        // The event API parses directly, so the flag must not change its
+        // results either.
+        const auto collect_events = [](std::string_view text,
+                                       const chyaml::parse_options& options) {
+            std::vector<std::string> events;
+            chyaml::event_parser parser;
+            if (!parser.reset_borrowed(text, options)) return events;
+            chyaml::event current;
+            for (;;) {
+                const auto status = parser.next(current);
+                if (status == chyaml::event_status::end) break;
+                if (status == chyaml::event_status::error) break;
+                std::string rendered;
+                rendered += std::to_string(static_cast<int>(current.type));
+                rendered += ':';
+                rendered += std::to_string(current.line);
+                rendered += ':';
+                rendered += std::to_string(current.column);
+                rendered += ':';
+                rendered += current.value;
+                events.push_back(std::move(rendered));
+            }
+            return events;
+        };
+        assert(collect_events(plain_stream, {}) == collect_events(plain_stream, parallel));
+    }
 
     return 0;
 }

@@ -130,6 +130,25 @@ for (;;) {
 }
 ```
 
+Long multi-document streams can be parsed concurrently:
+
+```cpp
+chyaml::parse_options options;
+options.parallel_documents = true;  // opt-in
+options.max_worker_threads = 8;     // 0 selects hardware concurrency
+
+chyaml::stream_parser stream;
+if (!stream.reset_borrowed(large_stream, options)) return false;
+```
+
+The splitter only builds a parallel plan when every document boundary is
+provable without parsing: no multi-line quoted scalars, no block scalars, no
+flow collections, and no directives may appear anywhere in the stream. It
+groups documents into chunks of at least 128 KiB so thread startup stays
+negligible, and any chunk that fails falls back to the sequential parser.
+Document order, contents, line numbers, and error positions are therefore
+identical to the sequential path for every input.
+
 ## Writing YAML and JSON
 
 ```cpp
@@ -237,6 +256,37 @@ When Python 3 is found during configuration, the
 `chyaml_comparison_suite` build target runs the same driver with its shorter
 7-run default.
 
+### Optimization matrix
+
+`chyaml_bench_suite` sweeps eight input shapes across the DOM and event APIs,
+separates parse from emit timing, reports retained memory per scenario in a
+fresh process, and measures concurrent node access. `tests/run_bench_matrix.py`
+runs every mode for one or two binaries and prints the ratios:
+
+```sh
+build/release/chyaml_bench_suite --mode dom --profile fast --csv
+build/release/chyaml_bench_suite --mode parallel --threads 8
+python tests/run_bench_matrix.py \
+  --a build/baseline/chyaml_bench_suite \
+  --b build/release/chyaml_bench_suite --scale 1 --repeats 3 --iterations 3
+```
+
+The comparison below used an Apple M4 Max (macOS 26.1, Apple clang 17,
+Release, `CHYAML_OPTIMIZE_FOR=SPEED`), full-size inputs, and the previous
+revision as the baseline:
+
+| Workload family | Parse speedup | Retained-memory reduction |
+|---|---:|---:|
+| DOM, portable 8-byte event tape | 1.03x - 1.31x | 1.20x - 1.22x |
+| DOM, complete path | 1.33x - 7.22x | 1.19x - 1.86x |
+| Event tape | 1.03x - 1.20x | about 1.00x |
+
+Over the 32 timing cells the geometric-mean speedup is 1.46x; over the 24
+memory cells the geometric-mean reduction is 1.18x. Emission throughput on the
+same inputs improved by about 1.6x - 1.8x. A 3.95 MB stream of 20,000 plain
+documents parses about 2.4x faster with `--mode parallel` and 8 workers, and
+its sequential path also benefits from the per-document arena layout.
+
 ## SIMD note
 
 chyaml uses portable scalar C++20 and deliberately avoids platform-specific
@@ -252,13 +302,16 @@ tags, anchors, aliases, complex keys, block scalars, flow collections,
 construction, YAML emission, and JSON emission.
 
 The conformance runner passes all 402 cases in the pinned official YAML Test
-Suite revision: 308 valid inputs accepted and 94 invalid inputs rejected.
+Suite revision: 308 valid inputs accepted and 94 invalid inputs rejected. Later
+upstream revisions add cases; against the current revision (406 cases) it
+passes 405, the exception being an upstream addition that expects
+`%YAML 1.1 1.2` to be accepted.
 
 ```sh
 build/release/chyaml_conformance /path/to/yaml-test-suite
 ```
 
-The current release is verified with MSVC 19.44 and GCC 12.2.
+The current release is verified with MSVC 19.44, GCC 12.2, and Apple clang 17.
 
 ## CMake options
 

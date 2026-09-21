@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -32,6 +33,16 @@ struct parse_options {
     bool preserve_comments{false};
     bool resolve_aliases{false};
     bool allow_duplicate_keys{true};
+    // Opt-in: when a multi-document stream is provably splittable, its
+    // documents are parsed on several threads and reassembled in order. The
+    // splitter refuses any input whose document boundaries cannot be
+    // established without parsing, and any failure falls back to the
+    // sequential path, so enabling this never changes parse results. Applies
+    // to stream_parser.
+    bool parallel_documents{false};
+    // Upper bound on worker threads for `parallel_documents`; 0 selects
+    // hardware concurrency.
+    std::uint32_t max_worker_threads{0};
 };
 
 struct parse_error {
@@ -180,6 +191,7 @@ private:
     friend class stream_parser;
     struct impl;
     bool adopt(void* native_document);
+    bool parse_owned(std::shared_ptr<std::string> owner, parse_options options);
     impl* impl_{nullptr};
 };
 
@@ -240,6 +252,7 @@ public:
 
 private:
     struct impl;
+    bool reset_owned(std::shared_ptr<std::string> owner, parse_options options);
     impl* impl_{nullptr};
 };
 

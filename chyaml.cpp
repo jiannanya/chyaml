@@ -1,6 +1,7 @@
 #include "chyaml.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
@@ -12,6 +13,7 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -21,6 +23,10 @@ namespace chyaml {
 namespace detail {
 
 constexpr std::uint32_t no_index = std::numeric_limits<std::uint32_t>::max();
+// Collections with fewer children than this are left without a stride hint:
+// walking a few dozen sibling links is already cheap, and skipping the
+// bookkeeping keeps the append path free of extra work for narrow collections.
+constexpr std::uint32_t stride_index_threshold = 64;
 constexpr std::uint64_t text_valid = std::uint64_t{1} << 63U;
 constexpr std::uint64_t text_pooled = std::uint64_t{1} << 62U;
 constexpr std::uint64_t text_length_mask = (std::uint64_t{1} << 30U) - 1U;
@@ -39,20 +45,32 @@ struct text_ref {
 struct document_state;
 
 struct node_data {
+    // Field order is deliberate: the scalar reference sits between the owner
+    // pointer and the counters so every member lands without padding and the
+    // node stays 64 bytes; keep new members grouped with their own width.
     document_state* owner{};
+    text_ref scalar{};
     std::uint32_t index{no_index};
     std::uint32_t parent{no_index};
     std::uint32_t first_child{no_index};
     std::uint32_t last_child{no_index};
     std::uint32_t next_sibling{no_index};
     std::uint32_t key{no_index};
-    std::uint32_t alias_target{no_index};
     std::uint32_t child_count{};
     std::uint32_t line{1};
     std::uint32_t column{1};
-    text_ref scalar{};
-    text_ref tag{};
-    text_ref anchor{};
+    // Most nodes carry neither a tag, an anchor, nor an alias target, so those
+    // rare values live in a side table instead of three references per node.
+    // `no_index` means "no entry"; see properties_of().
+    std::uint32_t properties{no_index};
+    // Non-zero when the children occupy a regular arithmetic progression of
+    // arena slots starting at first_child (stride 1 for block sequences and
+    // bare collections, 2 for plain mappings, and so on). Random access then
+    // costs one multiply and one bounds check instead of walking the sibling
+    // chain. A zero stride simply means "unknown" and the sibling walk is used;
+    // the field is filled in once after parsing and reset whenever the child
+    // list is mutated.
+    std::uint32_t child_stride{};
     node_type type_value{node_type::scalar};
     node_style style_value{node_style::plain};
     bool modified{};
@@ -63,12 +81,25 @@ struct node_data {
     void set_presentation(node_style value) noexcept { style_value = value; }
 };
 
-static_assert(sizeof(node_data) == 80);
+// Tag, anchor, and alias target of one node. Entries are created on demand, so
+// plain documents never allocate the table.
+struct node_properties {
+    text_ref tag{};
+    text_ref anchor{};
+    std::uint32_t alias_target{no_index};
+};
+
+static_assert(sizeof(node_data) == 64);
 static_assert(std::is_trivially_destructible_v<node_data>);
 
 class node_arena {
 public:
+    // A document with a few dozen nodes only touches the small first block,
+    // which keeps per-document streams of many small documents from allocating
+    // tens of kilobytes each, while uniform blocks keep large documents at few
+    // allocations. `block_size` counts only the uniform blocks.
     static constexpr std::size_t block_size = 1024;
+    static constexpr std::size_t first_block_size = 256;
 
     bool reserve_exact(std::size_t count) {
         if (size_ != 0 || reserved_ || !blocks_.empty() || count == 0) return count == 0;
@@ -89,11 +120,12 @@ public:
             return value;
         }
         const std::size_t overflow = size_ - reserved_capacity_;
-        const std::size_t block = overflow / block_size;
-        const std::size_t slot = overflow % block_size;
+        const std::size_t block = block_of(overflow);
+        const std::size_t slot = slot_of(overflow, block);
         if (block == blocks_.size()) {
+            const std::size_t capacity = block == 0 ? first_block_size : block_size;
             auto next = std::unique_ptr<std::byte[]>(new (std::nothrow)
-                std::byte[sizeof(node_data) * block_size]);
+                std::byte[sizeof(node_data) * capacity]);
             if (!next) return nullptr;
             blocks_.push_back(std::move(next));
         }
@@ -111,8 +143,9 @@ public:
             return &values[index];
         }
         const std::size_t overflow = index - reserved_capacity_;
-        auto* values = reinterpret_cast<node_data*>(blocks_[overflow / block_size].get());
-        return &values[overflow % block_size];
+        const std::size_t block = block_of(overflow);
+        auto* values = reinterpret_cast<node_data*>(blocks_[block].get());
+        return &values[slot_of(overflow, block)];
     }
 
     const node_data* at(std::uint32_t index) const noexcept {
@@ -122,14 +155,24 @@ public:
             return &values[index];
         }
         const std::size_t overflow = index - reserved_capacity_;
+        const std::size_t block = block_of(overflow);
         const auto* values = reinterpret_cast<const node_data*>(
-            blocks_[overflow / block_size].get());
-        return &values[overflow % block_size];
+            blocks_[block].get());
+        return &values[slot_of(overflow, block)];
     }
 
     std::size_t size() const noexcept { return size_; }
 
 private:
+    static std::size_t block_of(std::size_t overflow) noexcept {
+        if (overflow < first_block_size) return 0;
+        return 1 + (overflow - first_block_size) / block_size;
+    }
+
+    static std::size_t slot_of(std::size_t overflow, std::size_t block) noexcept {
+        return block == 0 ? overflow : (overflow - first_block_size) % block_size;
+    }
+
     std::unique_ptr<std::byte[]> reserved_{};
     std::size_t reserved_capacity_{};
     std::vector<std::unique_ptr<std::byte[]>> blocks_{};
@@ -141,9 +184,19 @@ struct document_state {
     std::string_view source{};
     std::string pool{};
     node_arena nodes{};
+    // Side table for the nodes that carry a tag, an anchor, or an alias target.
+    // Empty for documents without them, which keeps plain parses allocation-free
+    // beyond the node arena.
+    std::vector<node_properties> properties{};
     std::uint32_t root{no_index};
     std::size_t original_begin{};
     std::size_t original_end{};
+    // Line and column of the position `original_end` points at, precomputed so
+    // the event path never rescans the source. Kept in the event convention
+    // ("one past the last byte" counts a trailing newline as a new line), which
+    // is why it cannot simply be derived from the node locations.
+    std::size_t end_line{1};
+    std::size_t end_column{1};
     bool explicit_start{};
     bool explicit_end{};
     bool preserve_comments{};
@@ -191,21 +244,126 @@ struct document_state {
         if (!parent || !child || parent->owner != this || child->owner != this ||
             child->parent != no_index) return false;
         child->parent = parent->index;
-        if (parent->last_child == no_index) parent->first_child = child->index;
-        else nodes.at(parent->last_child)->next_sibling = child->index;
+        if (parent->last_child == no_index) {
+            parent->first_child = child->index;
+            parent->child_stride = 0;
+        } else {
+            node_data* previous = nodes.at(parent->last_child);
+            previous->next_sibling = child->index;
+            // Collections wide enough for a sibling walk to dominate random
+            // access get a regular-stride hint. Narrow ones are left at zero so
+            // the append path stays free of extra work for the common case: a
+            // mapping with a handful of keys is cheap to walk anyway.
+            if (parent->child_count >= stride_index_threshold) {
+                if (parent->child_count == stride_index_threshold) {
+                    seed_child_stride(parent);
+                } else if (parent->child_stride != 0) {
+                    const auto delta = static_cast<std::int64_t>(child->index) -
+                                       static_cast<std::int64_t>(previous->index);
+                    if (delta != static_cast<std::int64_t>(parent->child_stride))
+                        parent->child_stride = 0;
+                }
+            }
+        }
         parent->last_child = child->index;
         ++parent->child_count;
         return true;
     }
+
+    // Derives the regular-stride hint for a collection that just grew past the
+    // threshold. The walk is bounded by the threshold and happens at most once
+    // per collection, so its cost is negligible against the parse itself.
+    void seed_child_stride(node_data* parent) noexcept {
+        parent->child_stride = 0;
+        const node_data* previous = nodes.at(parent->first_child);
+        if (!previous) return;
+        const node_data* next = nodes.at(previous->next_sibling);
+        if (!next) return;
+        const auto delta = static_cast<std::int64_t>(next->index) -
+                           static_cast<std::int64_t>(previous->index);
+        if (delta <= 0 || delta > static_cast<std::int64_t>(no_index)) return;
+        const auto stride = static_cast<std::uint32_t>(delta);
+        while (next != nullptr) {
+            const node_data* following = nodes.at(next->next_sibling);
+            if (!following) break;
+            if (static_cast<std::int64_t>(following->index) -
+                    static_cast<std::int64_t>(next->index) !=
+                static_cast<std::int64_t>(stride)) return;
+            next = following;
+        }
+        parent->child_stride = stride;
+    }
 };
 
+// Tag, anchor, and alias target lookups. They are free functions so node_data
+// stays a plain aggregate; every node carries its owner, so no global state is
+// involved.
+inline node_properties* properties_of(node_data* value) noexcept {
+    if (!value || value->properties == no_index || !value->owner) return nullptr;
+    auto& table = value->owner->properties;
+    return value->properties < table.size() ? &table[value->properties] : nullptr;
+}
+
+inline const node_properties* properties_of(const node_data* value) noexcept {
+    return properties_of(const_cast<node_data*>(value));
+}
+
+// Returns the node's side-table entry, creating it on first use.
+inline node_properties& ensure_properties(node_data* value) {
+    auto& table = value->owner->properties;
+    if (value->properties == no_index) {
+        value->properties = static_cast<std::uint32_t>(table.size());
+        table.emplace_back();
+    }
+    return table[value->properties];
+}
+
+inline text_ref tag_ref(const node_data* value) noexcept {
+    const auto* props = properties_of(value);
+    return props ? props->tag : text_ref{};
+}
+
+inline text_ref anchor_ref(const node_data* value) noexcept {
+    const auto* props = properties_of(value);
+    return props ? props->anchor : text_ref{};
+}
+
+inline void set_tag(node_data* value, text_ref tag) {
+    ensure_properties(value).tag = tag;
+}
+
+inline void set_anchor(node_data* value, text_ref anchor) {
+    ensure_properties(value).anchor = anchor;
+}
+
+inline void set_alias_target(node_data* value, std::uint32_t target) {
+    ensure_properties(value).alias_target = target;
+}
+
+inline std::uint32_t alias_target_of(const node_data* value) noexcept {
+    const auto* props = properties_of(value);
+    return props ? props->alias_target : no_index;
+}
+
 struct line_info {
-    std::size_t start{};
-    std::size_t end{};
-    std::size_t content{};
+    // Offsets into the document, not whole-file offsets: text_ref already limits
+    // inputs to the 4 GiB addressable range, and four-byte fields cut the line
+    // table by 40%, which is the largest retained allocation of the complete
+    // path on wide documents.
+    std::uint32_t start{};
+    std::uint32_t end{};
+    std::uint32_t content{};
     std::uint32_t number{1};
     std::uint32_t indent{};
     bool tab_indent{};
+};
+
+// Handles and prefixes always point into the parser's source buffer, which
+// outlives the directive table, so they are held as views instead of owning
+// strings. Directive counts are tiny, so linear lookup beats hashing.
+struct tag_directive {
+    std::string_view handle{};
+    std::string_view prefix{};
 };
 
 struct parse_result {
@@ -237,11 +395,99 @@ std::string_view trim_view(std::string_view value) noexcept {
     return value;
 }
 
+// Character classification for the byte scans that dominate parsing and
+// emission. One table lookup replaces a chain of comparisons per byte, so an
+// ordinary byte costs a single load and one predictable branch.
+//
+// The fast event tape only covers constructs that cannot hide a character the
+// complete parser would treat specially, so any `fast_unsafe` byte makes the
+// builder refuse the input and the caller use the complete path instead.
+constexpr std::uint8_t classify_fast(char value) noexcept {
+    switch (value) {
+    case '\t': case '&': case '*': case '!': case '{': case '}':
+    case '[': case ']': case '|': case '>': case '\'': case '"': return 1;
+    case '#': return 2;
+    default: return 0;
+    }
+}
+
+// A leading '#' comments out the rest of a line, and a '#' preceded by a space
+// starts a comment inside an otherwise plain scalar.
+constexpr std::uint8_t classify_plain(char value) noexcept {
+    switch (value) {
+    case '\n': case '\r': case ',': case '[': case ']': case '{': case '}': return 1;
+    case '#': return 2;
+    case ':': return 3;
+    default: return 0;
+    }
+}
+
+// Bytes that a quoted scalar must escape: non-ASCII control bytes, the quote,
+// and the backslash. DEL is escaped only by JSON, which has no other way to
+// represent it.
+constexpr std::uint8_t classify_quoted(char value) noexcept {
+    if (static_cast<unsigned char>(value) < 0x20U) return 1;
+    if (value == '"' || value == '\\') return 1;
+    if (static_cast<unsigned char>(value) == 0x7fU) return 2;
+    return 0;
+}
+
+constexpr std::uint8_t classify_yaml_quoted(char value) noexcept {
+    if (static_cast<unsigned char>(value) < 0x20U) return 1;
+    if (value == '"' || value == '\\') return 1;
+    return 0;
+}
+
+template<std::uint8_t (*Classifier)(char)>
+struct byte_table {
+    std::uint8_t values[256]{};
+
+    constexpr byte_table() noexcept {
+        for (std::size_t index = 0; index < 256; ++index)
+            values[index] = Classifier(static_cast<char>(index));
+    }
+};
+
+// Bytes that change how `scan_mapping_colon` interprets a line. Ordinary bytes
+// are zero so the loop tests one loaded value per byte.
+enum : std::uint8_t {
+    colon_plain = 0,
+    colon_quote = 1,   // ' or ": only special as the first byte of the span
+    colon_anchor = 2,  // & or *: its name may hide a ':'
+    colon_open = 4,    // [ or {: depth increases
+    colon_close = 8,   // ] or }: depth decreases
+    colon_colon = 16   // : may terminate the key
+};
+
+constexpr std::uint8_t classify_colon(char value) noexcept {
+    switch (value) {
+    case '\'': case '"': return colon_quote;
+    case '&': case '*': return colon_anchor;
+    case '[': case '{': return colon_open;
+    case ']': case '}': return colon_close;
+    case ':': return colon_colon;
+    default: return colon_plain;
+    }
+}
+
+constexpr byte_table<classify_fast> fast_class{};
+constexpr byte_table<classify_plain> scalar_class{};
+constexpr byte_table<classify_quoted> quoted_class{};
+constexpr byte_table<classify_yaml_quoted> yaml_quoted_class{};
+constexpr byte_table<classify_colon> colon_class{};
+
 class yaml_parser {
 public:
     yaml_parser(std::string_view source, std::shared_ptr<std::string> owner,
-                parse_options options)
-        : source_(source), source_owner_(std::move(owner)), options_(options) {
+                parse_options options, std::size_t first_line_number = 1)
+        : source_(source), source_owner_(std::move(owner)), options_(options),
+          first_line_number_(first_line_number) {
+        // Line offsets are stored in 32 bits, matching the text_ref limit, so
+        // larger inputs are rejected before any table is built.
+        if (source_.size() > std::numeric_limits<std::uint32_t>::max()) {
+            fail("input exceeds the supported 4 GiB offset range", 1, 1);
+            return;
+        }
         build_lines();
     }
 
@@ -265,10 +511,30 @@ private:
     parse_options options_{};
     std::vector<line_info> lines_{};
     std::size_t line_index_{};
+    // Line number of the first physical line of `source_`. Parallel document
+    // parsing hands each chunk its own view, and this keeps the reported line
+    // numbers global to the original stream.
+    std::size_t first_line_number_{1};
+    // A monotonically advancing scan is the dominant access pattern for
+    // location() (every scalar reports its position), so one cached line index
+    // turns the common case into a pair of comparisons instead of a binary
+    // search. The cache is per-parser state, never shared between instances.
+    mutable std::size_t location_hint_{0};
+    // One-entry memos for the two line scanners. Every stored key is a
+    // (start, end) span inside the immutable source, so a hit is exact rather
+    // than heuristic.
+    mutable std::size_t strip_memo_start_{0};
+    mutable std::size_t strip_memo_end_{0};
+    mutable std::size_t strip_memo_result_{0};
+    mutable bool colon_memo_valid_{false};
+    mutable std::size_t colon_memo_start_{0};
+    mutable std::size_t colon_memo_end_{0};
+    mutable bool colon_memo_flow_{false};
+    mutable std::size_t colon_memo_result_{0};
     document_state* document_{};
     parse_error error_{};
-    std::unordered_map<std::string, std::uint32_t> anchors_{};
-    std::unordered_map<std::string, std::string> tag_directives_{};
+    std::unordered_map<std::string_view, std::uint32_t> anchors_{};
+    std::vector<tag_directive> tag_directives_{};
 
     void build_lines();
     void fail(std::string message, std::size_t line, std::size_t column);
@@ -281,6 +547,29 @@ private:
     std::string_view content_text(std::size_t index) const noexcept;
     bool marker(std::size_t index, std::string_view value) const noexcept;
     std::pair<std::size_t, std::size_t> location(std::size_t absolute) const noexcept;
+    // Line/column of `absolute` counting newlines in [0, absolute), which is
+    // the convention the document-end events use. Unlike location(), a position
+    // directly after a newline belongs to the next line.
+    std::pair<std::size_t, std::size_t> event_location(std::size_t absolute) const noexcept;
+
+    // Tag handle lookup and upsert. The table holds at most a handful of
+    // entries, so a linear scan avoids hashing and any allocation.
+    void set_tag_directive(std::string_view handle, std::string_view prefix) {
+        for (auto& entry : tag_directives_) {
+            if (entry.handle == handle) {
+                entry.prefix = prefix;
+                return;
+            }
+        }
+        tag_directives_.push_back({handle, prefix});
+    }
+
+    bool has_tag_directive(std::string_view handle) const noexcept {
+        for (const auto& entry : tag_directives_) {
+            if (entry.handle == handle) return true;
+        }
+        return false;
+    }
 
     std::unique_ptr<document_state> parse_document(std::size_t document_begin,
                                                    bool explicit_start);
@@ -292,6 +581,8 @@ private:
                             bool sequence_compact = false);
 
     std::size_t find_mapping_colon(std::size_t start, std::size_t end,
+                                   bool flow) const noexcept;
+    std::size_t scan_mapping_colon(std::size_t start, std::size_t end,
                                    bool flow) const noexcept;
     std::size_t strip_comment(std::size_t start, std::size_t end) const noexcept;
     properties parse_properties(std::size_t& position, std::size_t end);
@@ -328,6 +619,28 @@ namespace chyaml {
 
 namespace {
 
+// Reads a whole file into `text`. Seeks to the end first so the buffer is sized
+// exactly once; non-seekable sources (pipes, character devices) fall back to
+// the streaming path. Returns false when the file cannot be opened.
+bool read_file_contents(std::string_view path, std::string& text) {
+    std::ifstream input(std::string(path), std::ios::binary);
+    if (!input) return false;
+    text.clear();
+    input.seekg(0, std::ios::end);
+    const auto end_position = input.tellg();
+    if (end_position > 0) {
+        text.resize(static_cast<std::size_t>(end_position));
+        input.seekg(0, std::ios::beg);
+        input.read(text.data(), static_cast<std::streamsize>(text.size()));
+        if (input.gcount() != static_cast<std::streamsize>(text.size())) return false;
+        return true;
+    }
+    if (end_position == 0) return true;
+    input.clear();
+    text.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    return true;
+}
+
 detail::node_data* data_of(const node& value) noexcept {
     return static_cast<detail::node_data*>(value.native_handle());
 }
@@ -335,11 +648,91 @@ detail::node_data* data_of(const node& value) noexcept {
 const detail::node_data* child_at(const detail::node_data* parent,
                                   std::size_t requested) noexcept {
     if (!parent || requested >= parent->child_count) return nullptr;
+    if (parent->child_stride != 0) {
+        // Validated during indexing, so this is the k-th child directly. The
+        // parent check guards against a stale hint on a mutated collection.
+        const std::size_t index = static_cast<std::size_t>(parent->first_child) +
+            requested * static_cast<std::size_t>(parent->child_stride);
+        if (index <= std::numeric_limits<std::uint32_t>::max()) {
+            const auto* value = parent->owner->nodes.at(static_cast<std::uint32_t>(index));
+            if (value && value->parent == parent->index) return value;
+        }
+    }
     auto index = parent->first_child;
     while (requested-- && index != detail::no_index)
         index = parent->owner->nodes.at(index)->next_sibling;
     return parent->owner->nodes.at(index);
 }
+
+// Cursor-based writer over a std::string. Apple's libc++ keeps push_back and
+// append out of line, so per-byte calls dominate emission; writing through a
+// cursor turns the common case into a store plus a bounds check. The string is
+// grown geometrically, so the total copying stays linear, and its size is
+// committed once in finish().
+class text_writer {
+public:
+    explicit text_writer(std::string& sink, std::size_t reserve_bytes) : sink_(&sink) {
+        sink_->clear();
+        if (reserve_bytes < minimum_capacity) reserve_bytes = minimum_capacity;
+        sink_->resize(reserve_bytes);
+        cursor_ = sink_->data();
+        limit_ = cursor_ + reserve_bytes;
+    }
+
+    text_writer(const text_writer&) = delete;
+    text_writer& operator=(const text_writer&) = delete;
+
+    ~text_writer() { commit(); }
+
+    void put(char value) {
+        if (cursor_ == limit_) grow(1);
+        *cursor_++ = value;
+    }
+
+    void put(std::string_view text) {
+        if (static_cast<std::size_t>(limit_ - cursor_) < text.size()) grow(text.size());
+        if (!text.empty()) {
+            std::memcpy(cursor_, text.data(), text.size());
+            cursor_ += text.size();
+        }
+    }
+
+    void put(const char* data, std::size_t size) { put(std::string_view(data, size)); }
+    void put(const char* text) { put(std::string_view(text, std::strlen(text))); }
+
+    void fill(char value, std::size_t count) {
+        if (static_cast<std::size_t>(limit_ - cursor_) < count) grow(count);
+        if (count != 0) {
+            std::memset(cursor_, value, count);
+            cursor_ += count;
+        }
+    }
+
+    // Publishes the written bytes to the string. Called by the destructor, and
+    // explicitly when the result is needed before the writer goes out of scope.
+    void commit() noexcept {
+        if (sink_ == nullptr) return;
+        sink_->resize(static_cast<std::size_t>(cursor_ - sink_->data()));
+        sink_ = nullptr;
+    }
+
+private:
+    static constexpr std::size_t minimum_capacity = 256;
+
+    void grow(std::size_t needed) {
+        const std::size_t used = static_cast<std::size_t>(cursor_ - sink_->data());
+        const std::size_t current = sink_->size();
+        std::size_t target = current < minimum_capacity ? minimum_capacity : current * 2;
+        if (target < used + needed) target = used + needed;
+        sink_->resize(target);
+        cursor_ = sink_->data() + used;
+        limit_ = sink_->data() + target;
+    }
+
+    std::string* sink_{};
+    char* cursor_{};
+    char* limit_{};
+};
 
 bool scalar_needs_quotes(std::string_view value) noexcept {
     if (value.empty() || value.front() == ' ' || value.back() == ' ') return true;
@@ -348,37 +741,53 @@ bool scalar_needs_quotes(std::string_view value) noexcept {
         value == "true" || value == "True" || value == "TRUE" ||
         value == "false" || value == "False" || value == "FALSE") return true;
     for (std::size_t i = 0; i < value.size(); ++i) {
-        const char c = value[i];
-        if (detail::is_break(c) || c == '{' || c == '}' || c == '[' || c == ']' ||
-            c == ',' || (c == '#' && (i == 0 || detail::is_space(value[i - 1]))) ||
-            (c == ':' && (i + 1 == value.size() || detail::is_space(value[i + 1]))))
+        const auto kind = detail::scalar_class.values[
+            static_cast<unsigned char>(value[i])];
+        if (kind == 1) return true;
+        if (kind == 2 && (i == 0 || detail::is_space(value[i - 1]))) return true;
+        if (kind == 3 && (i + 1 == value.size() || detail::is_space(value[i + 1])))
             return true;
     }
     return false;
 }
 
-void append_quoted(std::string& output, std::string_view value, bool json = false) {
-    output.push_back('"');
+void append_quoted(text_writer& output, std::string_view value, bool json = false) {
+    // Characters that need an escape are rare in practice, so the bulk of the
+    // value is copied in runs with a single write per run.
+    output.put('"');
     static constexpr char hexadecimal[] = "0123456789abcdef";
-    for (unsigned char c : value) {
+    const auto* const classes = json ? detail::quoted_class.values
+                                     : detail::yaml_quoted_class.values;
+    const char* cursor = value.data();
+    const char* const limit = cursor + value.size();
+    const char* run = cursor;
+    while (cursor != limit) {
+        const auto c = static_cast<unsigned char>(*cursor);
+        if (classes[c] == 0) {
+            ++cursor;
+            continue;
+        }
+        if (run != cursor) output.put(run, static_cast<std::size_t>(cursor - run));
         switch (c) {
-        case '"': output += "\\\""; break;
-        case '\\': output += "\\\\"; break;
-        case '\b': output += "\\b"; break;
-        case '\f': output += "\\f"; break;
-        case '\n': output += "\\n"; break;
-        case '\r': output += "\\r"; break;
-        case '\t': output += "\\t"; break;
-        default:
-            if (c < 0x20U || (json && c == 0x7fU)) {
-                output += "\\u00";
-                output.push_back(hexadecimal[c >> 4U]);
-                output.push_back(hexadecimal[c & 15U]);
-            } else output.push_back(static_cast<char>(c));
+        case '"': output.put("\\\""); break;
+        case '\\': output.put("\\\\"); break;
+        case '\b': output.put("\\b"); break;
+        case '\f': output.put("\\f"); break;
+        case '\n': output.put("\\n"); break;
+        case '\r': output.put("\\r"); break;
+        case '\t': output.put("\\t"); break;
+        default: {
+            const char escape[] = {'\\', 'u', '0', '0',
+                                   hexadecimal[c >> 4U], hexadecimal[c & 15U]};
+            output.put(escape, sizeof(escape));
             break;
         }
+        }
+        ++cursor;
+        run = cursor;
     }
-    output.push_back('"');
+    if (run != limit) output.put(run, static_cast<std::size_t>(limit - run));
+    output.put('"');
 }
 
 bool looks_json_literal(std::string_view value) noexcept {
@@ -393,59 +802,77 @@ bool looks_json_literal(std::string_view value) noexcept {
 
 struct emitter {
     emit_options options{};
-    std::string* output{};
+    text_writer* output{};
     bool json{};
-    bool one_line{};
 
     void indent(std::size_t depth) {
-        output->append(depth * (options.indent ? options.indent : 2), ' ');
+        output->fill(' ', depth * (options.indent ? options.indent : 2));
     }
 
     void properties(const detail::node_data* value) {
-        const auto tag = value->owner->view(value->tag);
-        const auto anchor = value->owner->view(value->anchor);
-        if (!tag.empty()) { output->append(tag); output->push_back(' '); }
-        if (!anchor.empty()) { output->push_back('&'); output->append(anchor); output->push_back(' '); }
+        const auto* props = detail::properties_of(value);
+        if (props == nullptr) return;
+        const auto tag = value->owner->view(props->tag);
+        const auto anchor = value->owner->view(props->anchor);
+        if (!tag.empty()) { output->put(tag); output->put(' '); }
+        if (!anchor.empty()) { output->put('&'); output->put(anchor); output->put(' '); }
     }
 
     void scalar(const detail::node_data* value, bool key = false) {
         const auto text = value->owner->view(value->scalar);
         if (value->presentation() == node_style::alias) {
-            output->push_back('*'); output->append(text); return;
+            output->put('*'); output->put(text); return;
         }
         if (!json) properties(value);
         if (json) {
-            if (!key && looks_json_literal(text)) output->append(text);
+            if (!key && looks_json_literal(text)) output->put(text);
             else append_quoted(*output, text, true);
         } else if (value->presentation() == node_style::single_quoted) {
-            output->push_back('\'');
-            for (char c : text) { output->push_back(c); if (c == '\'') output->push_back('\''); }
-            output->push_back('\'');
+            // A single quote is doubled; every other byte is copied in runs, so
+            // ordinary scalars take one write instead of one call per byte.
+            output->put('\'');
+            const char* cursor = text.data();
+            const char* const limit = cursor + text.size();
+            const char* run = cursor;
+            while (cursor != limit) {
+                const void* found = std::memchr(cursor, '\'',
+                                                static_cast<std::size_t>(limit - cursor));
+                if (found == nullptr) break;
+                cursor = static_cast<const char*>(found);
+                output->put(run, static_cast<std::size_t>(cursor - run));
+                // A single quote inside a single-quoted scalar is doubled.
+                output->put('\'');
+                output->put('\'');
+                ++cursor;
+                run = cursor;
+            }
+            output->put(run, static_cast<std::size_t>(limit - run));
+            output->put('\'');
         } else if (value->presentation() == node_style::double_quoted || scalar_needs_quotes(text)) {
             append_quoted(*output, text);
-        } else output->append(text);
+        } else output->put(text);
     }
 
     void flow(const detail::node_data* value, std::size_t depth) {
         if (value->kind() == node_type::scalar) { scalar(value); return; }
         if (!json) properties(value);
         const bool mapping = value->kind() == node_type::mapping;
-        output->push_back(mapping ? '{' : '[');
+        output->put(mapping ? '{' : '[');
         bool first = true;
         for (auto index = value->first_child; index != detail::no_index;) {
             const auto* child = value->owner->nodes.at(index);
-            if (!first) output->append(one_line ? ", " : ", ");
+            if (!first) output->put(", ");
             first = false;
             if (mapping) {
                 const auto* key = value->owner->nodes.at(child->key);
                 if (key->kind() == node_type::scalar) scalar(key, true);
                 else flow(key, depth + 1);
-                output->append(": ");
+                output->put(": ");
             }
             flow(child, depth + 1);
             index = child->next_sibling;
         }
-        output->push_back(mapping ? '}' : ']');
+        output->put(mapping ? '}' : ']');
     }
 
     void block(const detail::node_data* value, std::size_t depth) {
@@ -457,21 +884,21 @@ struct emitter {
         }
         if (!json) properties(value);
         if (value->child_count == 0) {
-            output->append(value->kind() == node_type::mapping ? "{}" : "[]");
+            output->put(value->kind() == node_type::mapping ? "{}" : "[]");
             return;
         }
         bool first = true;
         for (auto index = value->first_child; index != detail::no_index;) {
             const auto* child = value->owner->nodes.at(index);
-            if (!first) output->push_back('\n');
+            if (!first) output->put('\n');
             first = false;
             indent(depth);
             if (value->kind() == node_type::sequence) {
-                output->push_back('-');
+                output->put('-');
                 if (child->kind() == node_type::scalar || child->presentation() == node_style::flow) {
-                    output->push_back(' '); block(child, depth + 1);
+                    output->put(' '); block(child, depth + 1);
                 } else {
-                    output->push_back('\n'); block(child, depth + 1);
+                    output->put('\n'); block(child, depth + 1);
                 }
             } else {
                 const auto* key = value->owner->nodes.at(child->key);
@@ -480,15 +907,15 @@ struct emitter {
                                     key->presentation() != node_style::folded;
                 if (simple) scalar(key, true);
                 else {
-                    output->append("? ");
+                    output->put("? ");
                     if (key) flow(key, depth + 1);
-                    output->push_back('\n'); indent(depth); output->push_back(':');
+                    output->put('\n'); indent(depth); output->put(':');
                 }
-                if (simple) output->push_back(':');
+                if (simple) output->put(':');
                 if (child->kind() == node_type::scalar || child->presentation() == node_style::flow) {
-                    output->push_back(' '); block(child, depth + 1);
+                    output->put(' '); block(child, depth + 1);
                 } else {
-                    output->push_back('\n'); block(child, depth + 1);
+                    output->put('\n'); block(child, depth + 1);
                 }
             }
             index = child->next_sibling;
@@ -499,32 +926,21 @@ struct emitter {
         json = options.style == emit_style::json ||
                options.style == emit_style::json_one_line ||
                options.style == emit_style::json_type_preserving;
-        one_line = json || options.style == emit_style::flow_one_line;
-        if (options.explicit_document_start && !json) output->append("---\n");
+        if (options.explicit_document_start && !json) output->put("---\n");
         if (json || options.style == emit_style::flow ||
             options.style == emit_style::flow_one_line) flow(root, 0);
         else block(root, 0);
-        if (options.explicit_document_end && !json) output->append("\n...");
-        if (!options.no_ending_newline) output->push_back('\n');
+        if (options.explicit_document_end && !json) output->put("\n...");
+        if (!options.no_ending_newline) output->put('\n');
     }
 };
-
-std::string key_text(const detail::node_data* key) {
-    if (!key) return {};
-    if (key->kind() == node_type::scalar) return std::string(key->owner->view(key->scalar));
-    std::string result;
-    emitter writer{{emit_style::flow_one_line}, &result};
-    writer.one_line = true;
-    writer.flow(key, 0);
-    return result;
-}
 
 void collect_events(const detail::node_data* value, std::vector<event>& output) {
     if (!value) return;
     event current;
     current.style = value->presentation();
-    current.tag = value->owner->view(value->tag);
-    current.anchor = value->owner->view(value->anchor);
+    current.tag = value->owner->view(detail::tag_ref(value));
+    current.anchor = value->owner->view(detail::anchor_ref(value));
     current.line = value->line;
     current.column = value->column;
     if (value->kind() == node_type::scalar) {
@@ -701,43 +1117,46 @@ private:
         value = trim(value);
         if (!value.length || input_[value.offset] == '?' || input_[value.offset] == '\'' ||
             input_[value.offset] == '"') return false;
-        for (std::size_t i = 0; i < value.length; ++i) {
-            if (input_[value.offset + i] != ':') continue;
-            if (i + 1 != value.length && input_[value.offset + i + 1] != ' ') continue;
-            key = trim({value.offset, i, value.line, value.line_start});
-            mapped = trim({value.offset + i + 1, value.length - i - 1,
+        // memchr skips the common "no colon at all" prefix far faster than a
+        // byte-at-a-time comparison, which matters for long plain values.
+        const char* const base = input_.data() + value.offset;
+        const char* cursor = base;
+        const char* const limit = base + value.length;
+        while (cursor != limit) {
+            const void* found = std::memchr(cursor, ':',
+                                            static_cast<std::size_t>(limit - cursor));
+            if (found == nullptr) break;
+            cursor = static_cast<const char*>(found);
+            const std::size_t offset = static_cast<std::size_t>(cursor - base);
+            ++cursor;
+            if (offset + 1 != value.length && base[offset + 1] != ' ') continue;
+            key = trim({value.offset, offset, value.line, value.line_start});
+            mapped = trim({value.offset + offset + 1, value.length - offset - 1,
                            value.line, value.line_start});
             return key.length != 0 && safe_plain(key);
         }
         return false;
     }
     bool safe_plain(fast_fragment value) const noexcept {
+        const auto* const bytes = reinterpret_cast<const unsigned char*>(
+            input_.data() + value.offset);
         for (std::size_t i = 0; i < value.length; ++i) {
-            switch (input_[value.offset + i]) {
-            case '\t': case '&': case '*': case '!': case '{': case '}':
-            case '[': case ']': case '|': case '>': case '\'': case '"': return false;
-            case '#':
-                if (i == 0 || input_[value.offset + i - 1] == ' ') return false;
-                break;
-            default: break;
-            }
+            const auto kind = detail::fast_class.values[bytes[i]];
+            if (kind == 1) return false;
+            if (kind == 2 && (i == 0 || bytes[i - 1] == ' ')) return false;
         }
         return true;
     }
     bool prepare_plain_value(fast_fragment& value) const noexcept {
+        const auto* const bytes = reinterpret_cast<const unsigned char*>(
+            input_.data() + value.offset);
         for (std::size_t i = 0; i < value.length; ++i) {
-            const char current = input_[value.offset + i];
-            switch (current) {
-            case '\t': case '&': case '*': case '!': case '{': case '}':
-            case '[': case ']': case '|': case '>': case '\'': case '"': return false;
-            case '#':
-                if (i == 0 || input_[value.offset + i - 1] == ' ') {
-                    value.length = i;
-                    value = trim(value);
-                    return true;
-                }
-                break;
-            default: break;
+            const auto kind = detail::fast_class.values[bytes[i]];
+            if (kind == 1) return false;
+            if (kind == 2 && (i == 0 || bytes[i - 1] == ' ')) {
+                value.length = i;
+                value = trim(value);
+                return true;
             }
         }
         return true;
@@ -967,10 +1386,9 @@ std::unique_ptr<detail::document_state> build_fast_document(
         default: break;
         }
     }
-    return stack.empty() && state->root != detail::no_index ? std::move(state)
-                                                            : nullptr;
+    if (!(stack.empty() && state->root != detail::no_index)) return {};
+    return state;
 }
-
 } // namespace
 
 struct document::impl {
@@ -1038,18 +1456,19 @@ std::string_view node::scalar() const noexcept {
 
 std::string_view node::tag() const noexcept {
     const auto* value = data_of(*this);
-    return value ? value->owner->view(value->tag) : std::string_view{};
+    return value ? value->owner->view(detail::tag_ref(value)) : std::string_view{};
 }
 
 std::string_view node::anchor() const noexcept {
     const auto* value = data_of(*this);
-    return value ? value->owner->view(value->anchor) : std::string_view{};
+    return value ? value->owner->view(detail::anchor_ref(value)) : std::string_view{};
 }
 
 node node::resolve_alias() const noexcept {
     const auto* value = data_of(*this);
-    return value && value->alias_target != detail::no_index
-        ? node(value->owner->nodes.at(value->alias_target)) : node{};
+    const auto target = detail::alias_target_of(value);
+    return value && target != detail::no_index
+        ? node(value->owner->nodes.at(target)) : node{};
 }
 
 std::size_t node::size() const noexcept {
@@ -1091,11 +1510,28 @@ node node::find(std::string_view simple_key) const noexcept {
 node node::find_yaml_key(std::string_view yaml_key) const noexcept {
     const auto* value = data_of(*this);
     if (!value || value->kind() != node_type::mapping) return {};
-    for (auto index = value->first_child; index != detail::no_index;) {
-        auto* child = value->owner->nodes.at(index);
-        if (key_text(value->owner->nodes.at(child->key)) == yaml_key) return node(child);
-        index = child->next_sibling;
-    }
+    try {
+        // Scalar keys are by far the common case and are compared in place;
+        // only composite keys pay for rendering, and they reuse one buffer for
+        // the whole scan instead of allocating per candidate.
+        std::string scratch;
+        for (auto index = value->first_child; index != detail::no_index;) {
+            auto* child = value->owner->nodes.at(index);
+            const auto* key = value->owner->nodes.at(child->key);
+            if (!key) {
+                if (yaml_key.empty()) return node(child);
+            } else if (key->kind() == node_type::scalar) {
+                if (value->owner->view(key->scalar) == yaml_key) return node(child);
+            } else {
+                text_writer buffer(scratch, 256);
+                emitter writer{{emit_style::flow_one_line}, &buffer};
+                writer.flow(key, 0);
+                buffer.commit();
+                if (scratch == yaml_key) return node(child);
+            }
+            index = child->next_sibling;
+        }
+    } catch (...) {}
     return {};
 }
 
@@ -1264,11 +1700,14 @@ bool document::parse_borrowed(std::string_view yaml, parse_options options) {
 }
 
 bool document::parse_copy(std::string_view yaml, parse_options options) {
+    return parse_owned(std::make_shared<std::string>(yaml), options);
+}
+
+bool document::parse_owned(std::shared_ptr<std::string> owner, parse_options options) {
     clear();
     impl_ = new (std::nothrow) impl;
     if (!impl_) return false;
     impl_->options = options;
-    auto owner = std::make_shared<std::string>(yaml);
     if (options.profile == parse_profile::fast && !options.preserve_comments &&
         !options.resolve_aliases) {
         impl_->state = build_fast_document(*owner, owner);
@@ -1283,19 +1722,15 @@ bool document::parse_copy(std::string_view yaml, parse_options options) {
 }
 
 bool document::parse_file(std::string_view path, parse_options options) {
-    std::ifstream input(std::string(path), std::ios::binary);
-    if (!input) {
+    std::string text;
+    if (!read_file_contents(path, text)) {
         clear(); impl_ = new (std::nothrow) impl;
         if (impl_) impl_->error.message = "unable to open YAML file";
         return false;
     }
-    input.seekg(0, std::ios::end);
-    const auto size = input.tellg();
-    input.seekg(0, std::ios::beg);
-    std::string text;
-    if (size > 0) text.resize(static_cast<std::size_t>(size));
-    if (!text.empty()) input.read(text.data(), static_cast<std::streamsize>(text.size()));
-    return input && parse_copy(text, options);
+    // The buffer is handed over rather than copied into the shared owner, so
+    // file parsing performs exactly one allocation for the whole source.
+    return parse_owned(std::make_shared<std::string>(std::move(text)), options);
 }
 
 bool document::create(parse_options options) {
@@ -1325,15 +1760,20 @@ const parse_error& document::error() const noexcept {
 
 bool document::resolve_aliases() {
     if (!impl_ || !impl_->state) return false;
-    std::unordered_map<std::string, std::uint32_t> anchors;
-    for (std::size_t i = 0; i < impl_->state->nodes.size(); ++i) {
-        auto* value = impl_->state->nodes.at(static_cast<std::uint32_t>(i));
-        const auto anchor_name = impl_->state->view(value->anchor);
-        if (!anchor_name.empty()) anchors[std::string(anchor_name)] = value->index;
+    auto& state = *impl_->state;
+    // Anchor names resolve to views into the document's own storage, which
+    // stays put for the lifetime of the document, so the table needs no owning
+    // string keys and performs no allocation per anchor.
+    std::unordered_map<std::string_view, std::uint32_t> anchors;
+    anchors.reserve(state.nodes.size() / 8 + 4);
+    for (std::size_t i = 0; i < state.nodes.size(); ++i) {
+        auto* value = state.nodes.at(static_cast<std::uint32_t>(i));
+        const auto anchor_name = state.view(detail::anchor_ref(value));
+        if (!anchor_name.empty()) anchors.insert_or_assign(anchor_name, value->index);
         if (value->presentation() == node_style::alias) {
-            const auto found = anchors.find(std::string(impl_->state->view(value->scalar)));
+            const auto found = anchors.find(state.view(value->scalar));
             if (found == anchors.end()) return false;
-            value->alias_target = found->second;
+            detail::set_alias_target(value, found->second);
         }
     }
     return true;
@@ -1357,7 +1797,14 @@ bool document::emit(std::string& output, emit_options options) const {
             output.push_back('\n');
         return true;
     }
-    emitter writer{options, &output};
+    emitter writer{options, nullptr};
+    // Emission writes at least one byte per input byte for the original and
+    // block styles, so one reservation removes the geometric regrowth (and its
+    // repeated copying) for large documents.
+    const std::size_t reserve_bytes =
+        state.source.size() + state.source.size() / 4 + 64;
+    text_writer buffer(output, reserve_bytes);
+    writer.output = &buffer;
     writer.write(state.nodes.at(state.root));
     return true;
 }
@@ -1418,6 +1865,12 @@ bool document::adopt(void* native_document) {
     return true;
 }
 
+// Fills `output` with every document of `yaml`, using the parallel splitter
+// when requested and possible and the sequential parser otherwise. Defined
+// after the event parser; declared here for the stream parser's reset paths.
+void parse_stream_documents(std::string_view yaml, std::shared_ptr<std::string> owner,
+                            parse_options options, detail::parse_result& output);
+
 stream_parser::~stream_parser() { clear(); }
 
 stream_parser::stream_parser(stream_parser&& other) noexcept : impl_(other.impl_) {
@@ -1435,33 +1888,32 @@ bool stream_parser::reset_borrowed(std::string_view yaml, parse_options options)
     clear();
     impl_ = new (std::nothrow) impl;
     if (!impl_) return false;
-    detail::yaml_parser parser(yaml, {}, options);
-    impl_->parsed = parser.parse_stream();
+    parse_stream_documents(yaml, {}, options, impl_->parsed);
     impl_->error_after = impl_->parsed.documents.size();
     return !impl_->parsed.documents.empty() || !impl_->parsed.error;
 }
 
 bool stream_parser::reset_copy(std::string_view yaml, parse_options options) {
+    return reset_owned(std::make_shared<std::string>(yaml), options);
+}
+
+bool stream_parser::reset_owned(std::shared_ptr<std::string> owner, parse_options options) {
     clear();
     impl_ = new (std::nothrow) impl;
     if (!impl_) return false;
-    auto owner = std::make_shared<std::string>(yaml);
-    detail::yaml_parser parser(*owner, owner, options);
-    impl_->parsed = parser.parse_stream();
+    parse_stream_documents(*owner, owner, options, impl_->parsed);
     impl_->error_after = impl_->parsed.documents.size();
     return !impl_->parsed.documents.empty() || !impl_->parsed.error;
 }
 
 bool stream_parser::reset_file(std::string_view path, parse_options options) {
-    std::ifstream input(std::string(path), std::ios::binary);
-    if (!input) {
+    std::string text;
+    if (!read_file_contents(path, text)) {
         clear(); impl_ = new (std::nothrow) impl;
         if (impl_) impl_->parsed.error.message = "unable to open YAML file";
         return false;
     }
-    std::string text((std::istreambuf_iterator<char>(input)),
-                     std::istreambuf_iterator<char>());
-    return reset_copy(text, options);
+    return reset_owned(std::make_shared<std::string>(std::move(text)), options);
 }
 
 stream_status stream_parser::next(document& output) {
@@ -1499,6 +1951,181 @@ void event_parser::clear() noexcept { delete impl_; impl_ = nullptr; }
 
 namespace {
 
+// One half-open byte range of a stream that is known to hold one or more whole
+// documents, because it starts at a document-start marker. `first_line` is the
+// 1-based physical line number of `begin` in the original stream, so the chunk
+// parser can report global line numbers.
+struct document_range {
+    std::size_t begin{};
+    std::size_t end{};
+    std::size_t first_line{1};
+};
+
+// Chunks smaller than this are not worth a worker thread: thread startup plus
+// the per-chunk line table cost more than parsing the bytes, so the splitter
+// groups boundaries until a chunk reaches this size.
+constexpr std::size_t minimum_parallel_chunk = 128U * 1024U;
+
+// Splits a multi-document stream at document-start markers so the documents can
+// be parsed concurrently. The scan is deliberately restrictive: it only reports
+// ranges when the stream provably cannot hide a marker inside a scalar or a
+// flow collection. Any unusual construct makes it return false and the caller
+// falls back to the sequential parser, which keeps results identical.
+//
+// The rejected constructs are exactly the ones that can span lines:
+//   " '        multi-line quoted scalars
+//   | >        block scalars, whose content lines may sit at column zero
+//   [ {        flow collections, whose plain scalars may span lines
+//   %          directives, which must stay attached to their document
+bool split_document_stream(std::string_view source,
+                          std::vector<document_range>& ranges) {
+    ranges.clear();
+    if (source.size() < minimum_parallel_chunk * 2) return false;
+
+    struct boundary {
+        std::size_t offset{};
+        std::size_t line{};
+    };
+    std::size_t bracket_depth = 0;
+    std::vector<boundary> boundaries;
+    std::size_t offset = 0;
+    std::size_t line_number = 1;
+    const std::size_t size = source.size();
+    while (offset < size) {
+        std::size_t end = source.find('\n', offset);
+        if (end == std::string_view::npos) end = size;
+        std::size_t line_end = end;
+        if (line_end > offset && source[line_end - 1] == '\r') --line_end;
+
+        for (std::size_t position = offset; position < line_end; ++position) {
+            switch (source[position]) {
+            case '"': case '\'': case '|': case '>': return false;
+            case '[': case '{': ++bracket_depth; break;
+            case ']': case '}': if (bracket_depth) --bracket_depth; break;
+            default: break;
+            }
+        }
+        if (bracket_depth != 0) return false;
+        if (source[offset] == '%') return false;
+        if (line_end - offset >= 3 && source.compare(offset, 3, "---") == 0) {
+            const std::size_t after = offset + 3;
+            if (after == line_end || source[after] == ' ' || source[after] == '\t' ||
+                source[after] == '#') {
+                boundaries.push_back({offset, line_number});
+            }
+        }
+        if (end == size) break;
+        offset = end + 1;
+        ++line_number;
+    }
+    if (boundaries.empty()) return false;
+
+    // Group the document starts into chunks of at least `minimum_parallel_chunk`
+    // bytes. Every range begins either at the stream start or at a boundary, and
+    // its end is the next chosen boundary, so a document can never straddle two
+    // ranges. A document that would cross the boundary is impossible because the
+    // boundary line is a marker the sequential parser would also recognize.
+    ranges.reserve(boundaries.size() + 1);
+    std::size_t begin = 0;
+    std::size_t begin_line = 1;
+    std::size_t index = 0;
+    while (index < boundaries.size()) {
+        std::size_t chosen = index;
+        while (chosen < boundaries.size() &&
+               boundaries[chosen].offset < begin + minimum_parallel_chunk) {
+            ++chosen;
+        }
+        if (chosen == boundaries.size()) break;
+        ranges.push_back({begin, boundaries[chosen].offset, begin_line});
+        begin = boundaries[chosen].offset;
+        begin_line = boundaries[chosen].line;
+        index = chosen;
+    }
+    ranges.push_back({begin, size, begin_line});
+    // Fewer than two non-empty ranges means nothing can run concurrently.
+    return ranges.size() >= 2;
+}
+
+std::size_t worker_thread_limit(std::uint32_t requested) noexcept {
+    if (requested != 0) return requested;
+    const auto hardware = std::thread::hardware_concurrency();
+    return hardware == 0 ? 1 : hardware;
+}
+
+} // namespace
+
+// Fills `output` with every document of `yaml`. When `parallel_documents` is
+// set and the stream is provably splittable, the ranges are parsed on several
+// threads; otherwise, and whenever any chunk fails, the sequential parser
+// produces the result together with the authoritative error position.
+void parse_stream_documents(std::string_view yaml, std::shared_ptr<std::string> owner,
+                            parse_options options, detail::parse_result& output) {
+    output.documents.clear();
+    output.error = {};
+
+    if (options.parallel_documents) {
+        std::vector<document_range> ranges;
+        if (split_document_stream(yaml, ranges)) {
+            const std::size_t chunk_count = ranges.size();
+            const std::size_t workers = (std::min)(chunk_count,
+                worker_thread_limit(options.max_worker_threads));
+            std::vector<detail::parse_result> chunks(chunk_count);
+            std::vector<char> failed(chunk_count, 0);
+            const auto parse_chunk = [&](std::size_t index) {
+                const auto& range = ranges[index];
+                detail::yaml_parser parser(
+                    yaml.substr(range.begin, range.end - range.begin), owner, options,
+                    range.first_line);
+                chunks[index] = parser.parse_stream();
+            };
+            if (workers <= 1) {
+                for (std::size_t index = 0; index < chunk_count; ++index) parse_chunk(index);
+            } else {
+                std::atomic<std::size_t> next{0};
+                std::vector<std::thread> pool;
+                pool.reserve(workers);
+                for (std::size_t worker = 0; worker < workers; ++worker) {
+                    pool.emplace_back([&] {
+                        for (;;) {
+                            const std::size_t index = next.fetch_add(1);
+                            if (index >= chunk_count) return;
+                            try {
+                                parse_chunk(index);
+                            } catch (...) {
+                                failed[index] = 1;
+                            }
+                        }
+                    });
+                }
+                for (auto& worker : pool) worker.join();
+            }
+
+            bool usable = true;
+            std::size_t total_documents = 0;
+            for (std::size_t index = 0; index < chunk_count; ++index) {
+                if (failed[index] || chunks[index].error) {
+                    usable = false;
+                    break;
+                }
+                total_documents += chunks[index].documents.size();
+            }
+            if (usable) {
+                output.documents.reserve(total_documents);
+                for (auto& chunk : chunks) {
+                    for (auto& document : chunk.documents)
+                        output.documents.push_back(std::move(document));
+                }
+                return;
+            }
+        }
+    }
+
+    detail::yaml_parser parser(yaml, std::move(owner), options);
+    output = parser.parse_stream();
+}
+
+namespace {
+
 template<class Storage>
 bool reset_events(Storage*& storage, std::string_view yaml,
                   std::shared_ptr<std::string> owner, parse_options options) {
@@ -1523,9 +2150,20 @@ bool reset_events(Storage*& storage, std::string_view yaml,
             return true;
         }
     }
+    // Unlike the stream parser, the event parser stays on the direct route: its
+    // callers are the ones that care most about linked size, and threading code
+    // is large. Event ordering is sequential here, and `parallel_documents` only
+    // applies to `stream_parser`.
     detail::yaml_parser parser(yaml, std::move(owner), options);
     storage->parsed = parser.parse_stream();
-    storage->buffered = false;
+    // Every node contributes a start or scalar event plus a matching end event,
+    // so the final event count is bounded by twice the node count plus the
+    // stream/document markers. Reserving once avoids repeated regrowth of a
+    // vector that can hold hundreds of thousands of entries.
+    std::size_t estimated_events = 2;
+    for (const auto& document : storage->parsed.documents)
+        estimated_events += document->nodes.size() * 2 + 2;
+    storage->events.reserve(estimated_events);
     event start;
     start.type = event_type::stream_start;
     start.line = 1;
@@ -1542,21 +2180,8 @@ bool reset_events(Storage*& storage, std::string_view yaml,
         collect_events(root, storage->events);
         event document_end;
         document_end.type = event_type::document_end;
-        const auto [end_line, end_column] = [&]() {
-            std::size_t position = document->original_end;
-            if (document->explicit_end) {
-                const auto marker_position = document->source.rfind("...", position);
-                if (marker_position != std::string_view::npos) position = marker_position;
-            }
-            std::size_t line = 1;
-            std::size_t column = 1;
-            for (std::size_t p = 0; p < position; ++p)
-                if (document->source[p] == '\n') { ++line; column = 1; }
-                else ++column;
-            return std::pair{line, column};
-        }();
-        document_end.line = end_line;
-        document_end.column = end_column;
+        document_end.line = document->end_line;
+        document_end.column = document->end_column;
         document_end.implicit = !document->explicit_end;
         storage->events.push_back(document_end);
     }
@@ -1578,11 +2203,10 @@ bool event_parser::reset_copy(std::string_view yaml, parse_options options) {
 }
 
 bool event_parser::reset_file(std::string_view path, parse_options options) {
-    std::ifstream input(std::string(path), std::ios::binary);
-    if (!input) { clear(); return false; }
-    std::string text((std::istreambuf_iterator<char>(input)),
-                     std::istreambuf_iterator<char>());
-    return reset_copy(text, options);
+    std::string text;
+    if (!read_file_contents(path, text)) { clear(); return false; }
+    auto owner = std::make_shared<std::string>(std::move(text));
+    return reset_events(impl_, *owner, owner, options);
 }
 
 event_status event_parser::next(event& output) {
@@ -1648,8 +2272,29 @@ namespace detail {
 
 void yaml_parser::build_lines() {
     lines_.clear();
+    // Grow the line table once instead of relying on geometric reallocation:
+    // a reallocation copies every previously stored entry, which dominates the
+    // scan itself for wide documents. The newline count is obtained with a
+    // byte scan (memchr) that is far cheaper than the copies it avoids.
+    std::size_t newline_count = 0;
+    {
+        const char* cursor = source_.data();
+        const char* const limit = cursor + source_.size();
+        while (cursor != limit) {
+            const void* found = std::memchr(cursor, '\n',
+                                            static_cast<std::size_t>(limit - cursor));
+            if (found == nullptr) break;
+            cursor = static_cast<const char*>(found) + 1;
+            ++newline_count;
+        }
+    }
+    lines_.reserve(newline_count + 2);
+
     std::size_t start = 0;
-    std::uint32_t number = 1;
+    std::uint32_t number = static_cast<std::uint32_t>(
+        (std::min)(first_line_number_,
+                   static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    bool first_physical_line = true;
     while (start < source_.size()) {
         std::size_t newline = source_.find('\n', start);
         if (newline == std::string_view::npos) newline = source_.size();
@@ -1662,18 +2307,22 @@ void yaml_parser::build_lines() {
             ++indent;
         }
         bool tab_indent = content < end && source_[content] == '\t';
-        if (number == 1 && content + 3 <= end &&
+        if (first_physical_line && content + 3 <= end &&
             static_cast<unsigned char>(source_[content]) == 0xefU &&
             static_cast<unsigned char>(source_[content + 1]) == 0xbbU &&
             static_cast<unsigned char>(source_[content + 2]) == 0xbfU) {
             content += 3;
         }
-        lines_.push_back({start, end, content, number, indent, tab_indent});
+        lines_.push_back({static_cast<std::uint32_t>(start),
+                          static_cast<std::uint32_t>(end),
+                          static_cast<std::uint32_t>(content), number, indent,
+                          tab_indent});
         if (newline == source_.size()) break;
         start = newline + 1;
         ++number;
+        first_physical_line = false;
     }
-    if (source_.empty()) lines_.push_back({0, 0, 0, 1, 0, false});
+    if (source_.empty()) lines_.push_back({0, 0, 0, number, 0, false});
 }
 
 void yaml_parser::fail(std::string message, std::size_t line, std::size_t column) {
@@ -1714,7 +2363,11 @@ std::string_view yaml_parser::content_text(std::size_t index) const noexcept {
 }
 
 bool yaml_parser::marker(std::size_t index, std::string_view value) const noexcept {
-    if (index >= lines_.size()) return false;
+    if (index >= lines_.size() || value.empty()) return false;
+    const auto& line = lines_[index];
+    // Almost every line fails on its first byte, so check that before doing the
+    // trimming and comparison work.
+    if (line.content >= line.end || source_[line.content] != value.front()) return false;
     auto text = trim_view(content_text(index));
     if (text.size() < value.size() || text.substr(0, value.size()) != value) return false;
     if (text.size() == value.size()) return true;
@@ -1728,11 +2381,33 @@ bool yaml_parser::marker(std::size_t index, std::string_view value) const noexce
 
 std::pair<std::size_t, std::size_t> yaml_parser::location(std::size_t absolute) const noexcept {
     if (lines_.empty()) return {1, 1};
+    const std::size_t count = lines_.size();
+    const std::size_t hint = location_hint_ < count ? location_hint_ : 0;
+    // Forward-marching access: the cached line, or the one right after it,
+    // already contains the offset. Both checks are a single comparison each.
+    if (absolute >= lines_[hint].start &&
+        (hint + 1 == count || absolute < lines_[hint + 1].start)) {
+        return {lines_[hint].number, absolute - lines_[hint].start + 1};
+    }
+    if (hint + 1 < count && absolute >= lines_[hint + 1].start &&
+        (hint + 2 == count || absolute < lines_[hint + 2].start)) {
+        location_hint_ = hint + 1;
+        return {lines_[hint + 1].number, absolute - lines_[hint + 1].start + 1};
+    }
     auto iterator = std::upper_bound(lines_.begin(), lines_.end(), absolute,
         [](std::size_t value, const line_info& line) { return value < line.start; });
     if (iterator != lines_.begin()) --iterator;
+    location_hint_ = static_cast<std::size_t>(iterator - lines_.begin());
     return {iterator->number, absolute >= iterator->start
         ? absolute - iterator->start + 1 : 1};
+}
+
+std::pair<std::size_t, std::size_t> yaml_parser::event_location(
+        std::size_t absolute) const noexcept {
+    if (absolute == 0 || lines_.empty()) return {1, 1};
+    const auto [line, column] = location(absolute - 1);
+    if (source_[absolute - 1] == '\n') return {line + 1, 1};
+    return {line, column + 1};
 }
 
 parse_result yaml_parser::parse_stream() {
@@ -1740,6 +2415,9 @@ parse_result yaml_parser::parse_stream() {
     line_index_ = 0;
     bool first_document = true;
     bool implicit_after_explicit_end = false;
+    // Handles declared by %TAG for the current document. Declared outside the
+    // loop so the buffer is reused across documents instead of reallocating.
+    std::vector<std::string_view> declared_tag_handles;
 
     while (true) {
         line_index_ = next_content(line_index_);
@@ -1747,12 +2425,12 @@ parse_result yaml_parser::parse_stream() {
 
         const std::size_t document_begin = lines_[line_index_].start;
         tag_directives_.clear();
-        tag_directives_.emplace("!", "!");
-        tag_directives_.emplace("!!", "tag:yaml.org,2002:");
+        declared_tag_handles.clear();
+        tag_directives_.push_back({"!", "!"});
+        tag_directives_.push_back({"!!", "tag:yaml.org,2002:"});
         bool saw_directive = false;
         bool saw_yaml_directive = false;
         bool explicit_start = false;
-        std::unordered_map<std::string, bool> declared_tag_handles;
 
         while (line_index_ < lines_.size()) {
             auto directive = trim_view(content_text(line_index_));
@@ -1800,11 +2478,13 @@ parse_result yaml_parser::parse_stream() {
                     fail("invalid TAG directive", lines_[line_index_].number, 1);
                     break;
                 }
-                if (!declared_tag_handles.emplace(std::string(handle), true).second) {
+                if (std::find(declared_tag_handles.begin(), declared_tag_handles.end(),
+                              handle) != declared_tag_handles.end()) {
                     fail("duplicate TAG directive", lines_[line_index_].number, 1);
                     break;
                 }
-                tag_directives_[std::string(handle)] = std::string(prefix);
+                declared_tag_handles.push_back(handle);
+                set_tag_directive(handle, prefix);
             }
             ++line_index_;
             line_index_ = next_content(line_index_);
@@ -1840,9 +2520,24 @@ parse_result yaml_parser::parse_stream() {
 
         line_index_ = next_content(line_index_);
         if (line_index_ < lines_.size() && marker(line_index_, "...")) {
-            result.documents.back()->explicit_end = true;
-            result.documents.back()->original_end =
-                lines_[line_index_].end + (lines_[line_index_].end < source_.size() ? 1U : 0U);
+            auto& finished = *result.documents.back();
+            finished.explicit_end = true;
+            const std::size_t marker_end = lines_[line_index_].end;
+            std::size_t position = marker_end + (marker_end < source_.size() ? 1U : 0U);
+            finished.original_end = position;
+            // The event convention points at the last "..." of the marker line,
+            // matching what a backward search over the document source found.
+            // The search is bounded to that line: the marker itself is an
+            // occurrence, so an earlier one can never be the last, and a
+            // whole-source rfind would scan the entire prefix per document
+            // (std::string_view::rfind searches forward to find the last match).
+            const std::size_t line_start = lines_[line_index_].start;
+            const auto marker_line = source_.substr(line_start, position - line_start);
+            const auto last_dots = marker_line.rfind("...");
+            if (last_dots != std::string_view::npos) position = line_start + last_dots;
+            const auto [end_line, end_column] = event_location(position);
+            finished.end_line = end_line;
+            finished.end_column = end_column;
             ++line_index_;
             implicit_after_explicit_end = true;
         }
@@ -1881,6 +2576,9 @@ std::unique_ptr<document_state> yaml_parser::parse_document(
         state->root = empty->index;
         state->original_end = line_index_ < lines_.size()
             ? lines_[line_index_].start : source_.size();
+        const auto [end_line, end_column] = event_location(state->original_end);
+        state->end_line = end_line;
+        state->end_column = end_column;
         return state;
     }
 
@@ -1890,6 +2588,9 @@ std::unique_ptr<document_state> yaml_parser::parse_document(
     state->root = root->index;
     state->original_end = line_index_ < lines_.size()
         ? lines_[line_index_].start : source_.size();
+    const auto [end_line, end_column] = event_location(state->original_end);
+    state->end_line = end_line;
+    state->end_column = end_column;
     return state;
 }
 
@@ -1941,6 +2642,21 @@ bool yaml_parser::duplicate_key(node_data* mapping, node_data* key) const {
 }
 
 std::size_t yaml_parser::strip_comment(std::size_t start, std::size_t end) const noexcept {
+    // Line-level parsing asks for the same (start, end) span from several
+    // layers (mapping detection, pair parsing, value parsing). Remembering the
+    // last answer removes those duplicate scans of the same bytes, which
+    // matters most for documents with long physical lines.
+    if (strip_memo_start_ == start && strip_memo_end_ == end) return strip_memo_result_;
+    // The scan only exists to find a '#'; when the span has none, one vectorized
+    // search answers the whole query. Most physical lines never contain a
+    // comment, so this is the path that matters for wide documents.
+    if (start >= end ||
+        std::memchr(source_.data() + start, '#', end - start) == nullptr) {
+        strip_memo_start_ = start;
+        strip_memo_end_ = end;
+        strip_memo_result_ = end;
+        return end;
+    }
     char quote = 0;
     std::size_t depth = 0;
     for (std::size_t position = start; position < end; ++position) {
@@ -1958,13 +2674,43 @@ std::size_t yaml_parser::strip_comment(std::size_t start, std::size_t end) const
         else if (current == '[' || current == '{') ++depth;
         else if ((current == ']' || current == '}') && depth) --depth;
         else if (current == '#' && depth == 0 &&
-                 (position == start || is_space(source_[position - 1]))) return position;
+                 (position == start || is_space(source_[position - 1]))) {
+            strip_memo_start_ = start;
+            strip_memo_end_ = end;
+            strip_memo_result_ = position;
+            return position;
+        }
     }
+    strip_memo_start_ = start;
+    strip_memo_end_ = end;
+    strip_memo_result_ = end;
     return end;
 }
 
 std::size_t yaml_parser::find_mapping_colon(std::size_t start, std::size_t end,
                                             bool flow) const noexcept {
+    if (colon_memo_valid_ && colon_memo_start_ == start && colon_memo_end_ == end &&
+        colon_memo_flow_ == flow) {
+        return colon_memo_result_;
+    }
+    const std::size_t result = scan_mapping_colon(start, end, flow);
+    colon_memo_valid_ = true;
+    colon_memo_start_ = start;
+    colon_memo_end_ = end;
+    colon_memo_flow_ = flow;
+    colon_memo_result_ = result;
+    return result;
+}
+
+std::size_t yaml_parser::scan_mapping_colon(std::size_t start, std::size_t end,
+                                            bool flow) const noexcept {
+    // A span without any ':' cannot contain a mapping colon, and one vectorized
+    // search answers that cheaper than the quote/bracket-aware scan. Sequence
+    // items and plain scalar values take this path constantly.
+    if (start >= end ||
+        std::memchr(source_.data() + start, ':', end - start) == nullptr) {
+        return std::string_view::npos;
+    }
     char quote = 0;
     std::size_t square = 0;
     std::size_t curly = 0;
@@ -1979,22 +2725,31 @@ std::size_t yaml_parser::find_mapping_colon(std::size_t start, std::size_t end,
             }
             continue;
         }
-        if ((current == '\'' || current == '"') && position == start) {
-            quote = current;
+        const auto kind = colon_class.values[static_cast<unsigned char>(current)];
+        if (kind == colon_plain) continue;
+        if (kind == colon_quote) {
+            if (position == start) quote = current;
             continue;
         }
-        if ((current == '&' || current == '*') && square == 0 && curly == 0) {
-            while (position + 1 < end && !is_space(source_[position + 1]) &&
-                   !is_break(source_[position + 1]) && source_[position + 1] != ',' &&
-                   source_[position + 1] != '[' && source_[position + 1] != ']' &&
-                   source_[position + 1] != '{' && source_[position + 1] != '}') ++position;
+        if (kind == colon_anchor) {
+            if (square == 0 && curly == 0) {
+                while (position + 1 < end && !is_space(source_[position + 1]) &&
+                       !is_break(source_[position + 1]) && source_[position + 1] != ',' &&
+                       source_[position + 1] != '[' && source_[position + 1] != ']' &&
+                       source_[position + 1] != '{' && source_[position + 1] != '}') ++position;
+            }
             continue;
         }
-        if (current == '[') { ++square; continue; }
-        if (current == '{') { ++curly; continue; }
-        if (current == ']' && square) { --square; continue; }
-        if (current == '}' && curly) { --curly; continue; }
-        if (current != ':' || square || curly) continue;
+        if (kind == colon_open) {
+            if (current == '[') ++square; else ++curly;
+            continue;
+        }
+        if (kind == colon_close) {
+            if (current == ']') { if (square) --square; }
+            else if (curly) --curly;
+            continue;
+        }
+        if (square || curly) continue;
         if (position + 1 == end || is_space(source_[position + 1]) ||
             (flow && (source_[position + 1] == ',' || source_[position + 1] == ']' ||
                       source_[position + 1] == '}'))) return position;
@@ -2185,8 +2940,7 @@ yaml_parser::properties yaml_parser::parse_properties(std::size_t& position,
             if (!raw.empty() && raw.front() == '!') {
                 const auto second = raw.find('!', 1);
                 if (second != std::string_view::npos) {
-                    const std::string handle(raw.substr(0, second + 1));
-                    if (tag_directives_.find(handle) == tag_directives_.end()) {
+                    if (!has_tag_directive(raw.substr(0, second + 1))) {
                         fail_at("undefined tag handle", begin - 1);
                         return result;
                     }
@@ -2201,21 +2955,22 @@ yaml_parser::properties yaml_parser::parse_properties(std::size_t& position,
 void yaml_parser::apply_properties(node_data* value, const properties& props) {
     if (!value) return;
     if (props.tag.valid()) {
-        if (value->tag.valid()) {
+        if (tag_ref(value).valid()) {
             fail("a node cannot have more than one tag", value->line, value->column);
             return;
         }
-        value->tag = props.tag;
+        set_tag(value, props.tag);
     }
     if (props.anchor.valid()) {
-        if (value->anchor.valid()) {
+        if (anchor_ref(value).valid()) {
             fail("a node cannot have more than one anchor", value->line, value->column);
             return;
         }
-        value->anchor = props.anchor;
-        const auto name = document_->view(props.anchor);
-        auto [entry, inserted] = anchors_.emplace(std::string(name), value->index);
-        if (!inserted) entry->second = value->index;
+        set_anchor(value, props.anchor);
+        // Anchor names always live in the source buffer, so the map can key on
+        // views and skip the per-anchor string allocation. Later definitions of
+        // the same name deliberately win, matching the previous behaviour.
+        anchors_.insert_or_assign(document_->view(props.anchor), value->index);
     }
 }
 
@@ -2443,8 +3198,8 @@ node_data* yaml_parser::parse_value(std::size_t& index, std::size_t start,
         value = make_scalar(document_->source_text(name, position - name),
                             node_style::alias, name - 1);
         if (value) {
-            const auto found = anchors_.find(std::string(document_->view(value->scalar)));
-            if (found != anchors_.end()) value->alias_target = found->second;
+            const auto found = anchors_.find(document_->view(value->scalar));
+            if (found != anchors_.end()) set_alias_target(value, found->second);
         }
         while (position < end && is_space(source_[position])) ++position;
         if (position != end) fail_at("unexpected content after alias", position);
@@ -2493,7 +3248,9 @@ node_data* yaml_parser::parse_plain(std::size_t& index, std::size_t start,
         }
     }
     const std::size_t physical_end = end;
-    end = strip_comment(start, end);
+    // `end` already arrives comment-stripped from parse_value, and stripping a
+    // stripped span is a no-op, so the rescan is skipped. Every `end` handed to
+    // this function comes from parse_value, which guarantees that contract.
     const auto comment_iterator = std::find(source_.begin() + static_cast<std::ptrdiff_t>(end),
         source_.begin() + static_cast<std::ptrdiff_t>(lines_[first_line].end), '#');
     const auto comment_position = comment_iterator == source_.begin() +
@@ -2504,11 +3261,24 @@ node_data* yaml_parser::parse_plain(std::size_t& index, std::size_t start,
         (comment_position < lines_[first_line].end &&
          (comment_position == start || is_space(source_[comment_position - 1])));
     while (end > start && is_space(source_[end - 1])) --end;
-    for (std::size_t p = start; p < end; ++p) {
-        if (source_[p] == ':' && p + 1 < end && is_space(source_[p + 1])) {
-            if (key_context) { end = p; break; }
-            fail_at("mapping indicator is not allowed inside a plain scalar", p);
-            return nullptr;
+    // A ':' followed by a space or at the end of the scalar is either the key
+    // terminator or a syntax error inside a plain value. Searching for ':' with
+    // memchr skips runs without one in a single vectorized step.
+    {
+        const char* const base = source_.data();
+        std::size_t probe = start;
+        while (probe < end) {
+            const void* found = std::memchr(base + probe, ':',
+                                            end - probe);
+            if (found == nullptr) break;
+            const std::size_t position = static_cast<std::size_t>(
+                static_cast<const char*>(found) - base);
+            if (position + 1 < end && is_space(source_[position + 1])) {
+                if (key_context) { end = position; break; }
+                fail_at("mapping indicator is not allowed inside a plain scalar", position);
+                return nullptr;
+            }
+            probe = position + 1;
         }
     }
 
@@ -2806,7 +3576,8 @@ node_data* yaml_parser::parse_block_scalar(std::size_t& index, std::size_t start
         if (indicator == '>' && previous_text && trailing_breaks == 0) decoded.push_back(' ');
         else if (!decoded.empty()) decoded.append((std::max)(std::size_t{1}, trailing_breaks), '\n');
         trailing_breaks = 0;
-        const std::size_t begin = (std::min)(info.start + content_indent, info.end);
+        const std::size_t begin = (std::min)(static_cast<std::size_t>(info.start) +
+            content_indent, static_cast<std::size_t>(info.end));
         decoded.append(source_.substr(begin, info.end - begin));
         previous_text = true;
         ++cursor;
@@ -2831,7 +3602,11 @@ void yaml_parser::flow_skip(flow_cursor& cursor) {
         if (crossed_line) {
             const auto [line_number, column] = location(cursor.position);
             (void)column;
-            const auto& info = lines_[(std::min)(line_number - 1, lines_.size() - 1)];
+            // Line numbers are global; the table index is relative to this
+            // parser's first line.
+            const std::size_t line_index = line_number > first_line_number_
+                ? (std::min)(line_number - first_line_number_, lines_.size() - 1) : 0;
+            const auto& info = lines_[line_index];
             if (info.indent < cursor.minimum_indent && current != ']' && current != '}') {
                 fail_at("invalid flow collection indentation", cursor.position);
                 return;
@@ -2969,8 +3744,8 @@ node_data* yaml_parser::parse_flow_node(flow_cursor& cursor, bool key_context) {
         value = make_scalar(document_->source_text(name, cursor.position - name),
                             node_style::alias, start);
         if (value) {
-            const auto found = anchors_.find(std::string(document_->view(value->scalar)));
-            if (found != anchors_.end()) value->alias_target = found->second;
+            const auto found = anchors_.find(document_->view(value->scalar));
+            if (found != anchors_.end()) set_alias_target(value, found->second);
         }
         break;
     }

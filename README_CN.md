@@ -106,6 +106,19 @@ for (;;) {
 }
 ```
 
+长多文档流可以并行解析：
+
+```cpp
+chyaml::parse_options options;
+options.parallel_documents = true;  // 按需开启
+options.max_worker_threads = 8;     // 0 表示使用硬件并发度
+
+chyaml::stream_parser stream;
+if (!stream.reset_borrowed(large_stream, options)) return false;
+```
+
+切分器只在所有文档边界都无需真正解析即可确定时才启用并行：流中不得出现跨行引号标量、块标量、流集合或指令。它把文档按至少 128 KiB 一组打包，使线程启动开销可以忽略；任一分块失败都会回退到顺序解析。因此文档顺序、内容、行号和错误位置在任何输入上都与顺序路径完全一致。
+
 ## 写入 YAML 与 JSON
 
 ```cpp
@@ -185,6 +198,28 @@ python tests/run_comparison.py \
 
 配置阶段找到 Python 3 时，还会提供 `chyaml_comparison_suite` 构建目标，以较短的默认 7 组运行执行同一驱动器。
 
+### 优化对照矩阵
+
+`chyaml_bench_suite` 覆盖八种输入形态，分别测量 DOM 与事件 API，把解析与输出计时分离，在独立进程中报告每个场景的增量内存，并测量并发节点访问。`tests/run_bench_matrix.py` 可对一两个二进制运行全部模式并打印比值：
+
+```sh
+build/release/chyaml_bench_suite --mode dom --profile fast --csv
+build/release/chyaml_bench_suite --mode parallel --threads 8
+python tests/run_bench_matrix.py \
+  --a build/baseline/chyaml_bench_suite \
+  --b build/release/chyaml_bench_suite --scale 1 --repeats 3 --iterations 3
+```
+
+下表的对照环境为 Apple M4 Max（macOS 26.1、Apple clang 17、Release、`CHYAML_OPTIMIZE_FOR=SPEED`），输入为完整规模，基线为上一版本：
+
+| 工作负载类别 | 解析加速 | 增量内存降低 |
+|---|---:|---:|
+| DOM，可移植 8 字节事件带 | 1.03x - 1.31x | 1.20x - 1.22x |
+| DOM，完整路径 | 1.33x - 7.22x | 1.19x - 1.86x |
+| 事件带 | 1.03x - 1.20x | 约 1.00x |
+
+32 个计时单元的几何平均加速为 1.46x；24 个内存单元的几何平均降低为 1.18x。同一批输入的输出吞吐提升约 1.6x - 1.8x。3.95 MB、20,000 个纯量文档组成的流在 `--mode parallel`、8 个工作线程下约快 2.4 倍，其顺序路径也从按文档的 arena 布局中获益。
+
 ## SIMD 说明
 
 chyaml 使用可移植纯标量 C++20，主动避免平台专用 SIMD/目标调优。rapidyaml 0.16.0 的 YAML 结构解析器也主要是可移植状态机；其捆绑的数值转换代码包含可选 SSE2/NEON 分支，但它们不是主要的 YAML 结构扫描器。
@@ -193,13 +228,13 @@ chyaml 使用可移植纯标量 C++20，主动避免平台专用 SIMD/目标调�
 
 功能测试覆盖 DOM 访问、文档流、事件位置、标签、锚点、别名、复杂键、块标量、流集合、构造、YAML 输出和 JSON 输出。
 
-规范运行器通过固定版本官方 YAML Test Suite 的全部 402 项：接受 308 个有效输入，拒绝 94 个无效输入。
+规范运行器通过固定版本官方 YAML Test Suite 的全部 402 项：接受 308 个有效输入，拒绝 94 个无效输入。更高的上游版本会新增用例：对当前版本（406 项）通过 405 项，唯一例外是上游新增的、期望接受 `%YAML 1.1 1.2` 的用例。
 
 ```sh
 build/release/chyaml_conformance /path/to/yaml-test-suite
 ```
 
-当前版本已使用 MSVC 19.44 和 GCC 12.2 验证。
+当前版本已使用 MSVC 19.44、GCC 12.2 和 Apple clang 17 验证。
 
 ## CMake 选项
 
