@@ -9,11 +9,13 @@ instead of ad-hoc invocations.
 usage:
     run_bench_matrix.py --a build/chyaml_bench_suite
     run_bench_matrix.py --a old/chyaml_bench_suite --b new/chyaml_bench_suite \
-        [--scale 12] [--repeats 4] [--iterations 3] [--threads 8] [--csv out.csv]
+        [--scale 12] [--repeats 4] [--iterations 3] [--threads 8] \
+        [--runs 3] [--csv out.csv]
 """
 
 import argparse
 import csv
+import statistics
 import subprocess
 import sys
 from pathlib import Path
@@ -40,6 +42,7 @@ MEMORY_MODES = [
     ("mem-dom-fast", "memory", "fast"),
     ("mem-dom-compact", "memory", "compact"),
     ("mem-events-fast", "memory-events", "fast"),
+    ("mem-events-compact", "memory-events", "compact"),
 ]
 
 
@@ -117,7 +120,7 @@ def report(a, b, label_a, label_b):
                 speedup = ratio(first, second)
                 line += f"{second:>12.3f}{speedup:>9.2f}x"
                 summary.append(speedup)
-            print(line + f"{a['timing'][key]['mb_per_second']:>10.1f}")
+            print(line + f"{(b if two else a)['timing'][key]['mb_per_second']:>10.1f}")
     if summary:
         geometric = 1.0
         for value in summary:
@@ -126,10 +129,26 @@ def report(a, b, label_a, label_b):
         print(f"\ngeometric mean speedup over {len(summary)} timing cells: {geometric:.3f}x")
 
     print()
+    print("EMISSION  (GB/s, higher is better)")
+    print(f"{'mode':<16}{'scenario':<18}{label_a:>12}" +
+          (f"{label_b:>12}{'speedup':>10}" if two else ""))
+    for label, _, _ in TIMING_MODES:
+        for scenario in SCENARIOS:
+            key = (label, scenario)
+            first = a["timing"][key]["emit_gbps"]
+            if first <= 0:
+                continue
+            line = f"{label:<16}{scenario:<18}{first:>12.3f}"
+            if two:
+                second = b["timing"][key]["emit_gbps"]
+                line += f"{second:>12.3f}{second / first:>9.2f}x"
+            print(line)
+
+    print()
     print("=" * 96)
     print("MEMORY  (retained delta bytes, lower is better)")
     print("=" * 96)
-    header = f"{'mode':<18}{'scenario':<18}{label_a:>14}"
+    header = f"{'mode':<20}{'scenario':<18}{label_a:>14}"
     if two:
         header += f"{label_b:>14}{'reduction':>11}"
     print(header + f"{'ratio':>9}")
@@ -140,13 +159,15 @@ def report(a, b, label_a, label_b):
             if key not in a["memory"]:
                 continue
             first = a["memory"][key]["delta_bytes"]
-            line = f"{label:<18}{scenario:<18}{first:>14.0f}"
+            line = f"{label:<20}{scenario:<18}{first:>14.0f}"
             if two:
                 second = b["memory"][key]["delta_bytes"]
                 reduction = ratio(first, second)
-                line += f"{second:>14.0f}{reduction:>10.2f}x"
-                memory_summary.append(reduction)
-            print(line + f"{a['memory'][key]['memory_ratio']:>9.3f}")
+                factor = f"{reduction:.2f}x" if reduction is not None else "n/a"
+                line += f"{second:>14.0f}{factor:>11}"
+                if reduction is not None:
+                    memory_summary.append(reduction)
+            print(line + f"{(b if two else a)['memory'][key]['memory_ratio']:>9.3f}")
     if memory_summary:
         geometric = 1.0
         for value in memory_summary:
@@ -185,6 +206,33 @@ def report(a, b, label_a, label_b):
         print(f"\ngeometric mean concurrency speedup: {geometric:.3f}x")
 
 
+def aggregate(samples):
+    result = {"timing": {}, "memory": {}, "threads": {}}
+    for category in ("timing", "memory"):
+        for key, metrics in samples[0][category].items():
+            result[category][key] = {
+                metric: statistics.median(sample[category][key][metric] for sample in samples)
+                for metric in metrics
+            }
+    for key in samples[0]["threads"]:
+        result["threads"][key] = statistics.median(sample["threads"][key] for sample in samples)
+    return result
+
+
+def write_csv(path, a, b):
+    with Path(path).open("w", newline="", encoding="utf-8") as output:
+        writer = csv.writer(output, lineterminator="\n")
+        writer.writerow(("category", "mode", "scenario", "metric", "before", "after"))
+        for category in ("timing", "memory"):
+            for (mode, scenario), metrics in a[category].items():
+                for metric, first in metrics.items():
+                    second = b[category][(mode, scenario)][metric] if b else ""
+                    writer.writerow((category, mode, scenario, metric, first, second))
+        for threads, first in a["threads"].items():
+            writer.writerow(("threads", threads, "mixed_records", "mb_per_second",
+                             first, b["threads"][threads] if b else ""))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--a", required=True)
@@ -195,13 +243,25 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=4)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--runs", type=int, default=1,
+                        help="median across runs, alternating binary order")
+    parser.add_argument("--csv", help="save the measured cells as CSV")
     args = parser.parse_args()
+    if min(args.scale, args.repeats, args.iterations, args.threads, args.runs) < 1:
+        parser.error("scale, repeats, iterations, threads and runs must be positive")
 
     first = Path(args.a).resolve()
     second = Path(args.b).resolve() if args.b else None
-    data_a = collect(first, args.scale, args.repeats, args.iterations, args.threads)
-    data_b = collect(second, args.scale, args.repeats, args.iterations, args.threads) \
-        if second else None
+    samples = {"a": [], "b": []}
+    binaries = [("a", first)] + ([("b", second)] if second else [])
+    for run_index in range(args.runs):
+        for label, binary in (binaries if run_index % 2 == 0 else list(reversed(binaries))):
+            samples[label].append(collect(binary, args.scale, args.repeats,
+                                          args.iterations, args.threads))
+    data_a = aggregate(samples["a"])
+    data_b = aggregate(samples["b"]) if second else None
+    if args.csv:
+        write_csv(args.csv, data_a, data_b)
     report(data_a, data_b, args.label_a, args.label_b)
     return 0
 

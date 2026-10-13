@@ -1,0 +1,23 @@
+{
+  "platform": "macOS-26.1-arm64-arm-64bit",
+  "machine": "arm64",
+  "scale": 1,
+  "runs": 6,
+  "repeats": 5,
+  "iterations": 5,
+  "tolerance": 0.0,
+  "binaries": {
+    "baseline": {
+      "path": "/Users/cc/ai/chyaml/build/perf-before/chyaml_bench_suite",
+      "sha256": "3b732aa2588a3cfada717cc289dfee32c5c019aed23849590a67b1758881d69d"
+    },
+    "previous": {
+      "path": "/Users/cc/ai/chyaml/build/round2-start/chyaml_bench_suite",
+      "sha256": "6af6096749089a32d27b1dce45884733cda914de38a36336bb403704411e2176"
+    },
+    "candidate": {
+      "path": "/Users/cc/ai/chyaml/build/round2/chyaml_bench_suite",
+      "sha256": "06a17ef6a91bd8e1dc6acc2982f5fa93daf3bf5431bbdee989aae3fe729ccd5c"
+    }
+  }
+}

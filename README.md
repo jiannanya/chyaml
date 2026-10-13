@@ -73,9 +73,10 @@ flow sequences, comments, blank lines, and document markers. It stores two
 locations are recovered by one monotonic scan during traversal. Reusing an
 `event_parser` reuses tape capacity.
 
-`buffered()` reports whether the 8-byte tape was selected. If it returns
-false, parsing still supports the complete grammar through the native complete
-path.
+`buffered()` reports whether the fast tape referencing input bytes was selected.
+If it returns false, the complete path still supports the full grammar. That path
+retains a DOM and stores each event as an 8-byte node reference, expanding it into
+the public `event` only when consumed.
 
 `reset_borrowed()` does not own its input; keep it alive and at a stable address
 until parsing and event consumption finish. Use `reset_copy()` when the parser
@@ -111,6 +112,13 @@ references for strings, borrows unchanged scalar bytes, and preallocates the
 exact node count on the fast path. Important APIs include `find()`,
 `find_yaml_key()`, `at()`, `pair_at()`, `by_path()`, `tag()`, `anchor()`,
 `resolve_alias()`, and typed scalar conversions.
+
+Wide collections use a regular node stride or an explicit child index for
+constant-time `at()` / `pair_at()` access. Indices are maintained during parsing
+and appending, so concurrent readers of an unchanged document never create
+shared caches. Setting `allow_duplicate_keys = false` checks scalar keys on all
+parse entry points, using stable string offsets for hashing instead of repeated
+mapping scans.
 
 `parse_copy()` owns an input copy, while `parse_file()` reads a file. Node
 handles must not outlive their document.
@@ -167,125 +175,10 @@ to caller-managed storage. Documents may also be created with `create()`,
 `make_scalar()`, `make_sequence()`, `make_mapping()`, `append()`, and
 `set_root()`.
 
-## Performance snapshot
+## Performance
 
-Measured on 2026-08-24 using an AMD Ryzen 9 9950X, Windows x64, MSVC 19.44
-Release, and a 4,627,797-byte input containing 50,000 records. Each parser runs
-in a separate process. Values are medians of 15 alternating paired runs with
-25 steady-state parses per run; parser capacity is reused.
-
-| Mode | Parse/materialize | Observed private-memory delta | Units |
-|---|---:|---:|---:|
-| chyaml portable 8-byte event tape | about 391 MB/s | about 6.18 MB | 750,009 events |
-| rapidyaml 0.16.0 arena tree | about 184 MB/s | about 81.49 MB | 450,003 nodes |
-
-On this workload, the chyaml tape is about 2.13x faster and uses about 13.18x less
-incremental memory. A Release size probe linked to the full chyaml DOM API was
-about 110 KB versus about 127 KB for the comparison tree API. These structures
-serve different access patterns, so the numbers describe this workload and do
-not imply identical semantics or universal performance.
-
-The original workload above remains the built-in single-workload benchmark. A
-second suite covers eight input shapes. The following results use the same
-machine and toolchain, with 9 alternating paired runs per scenario and 15
-steady-state parses per process sample. Every sample starts a fresh process;
-both executables compile the same shared input generators.
-
-| Workload | Input MiB | chyaml MB/s | rapidyaml MB/s | Speed ratio | chyaml memory MiB | rapidyaml memory MiB | Memory ratio |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Mixed records | 4.41 | 396.1 | 184.9 | 2.14x | 5.90 | 77.15 | 13.07x |
-| Flat mapping | 4.77 | 682.7 | 316.1 | 2.16x | 6.37 | 42.01 | 6.59x |
-| Scalar sequence | 6.82 | 882.6 | 458.5 | 1.92x | 9.11 | 44.05 | 4.84x |
-| Nested mappings | 3.27 | 316.4 | 272.8 | 1.16x | 4.38 | 39.92 | 9.12x |
-| Flow sequences | 5.14 | 310.0 | 152.7 | 2.03x | 10.31 | 150.01 | 14.55x |
-| Quoted strings | 6.50 | 1436.1 | 733.2 | 1.96x | 8.69 | 25.71 | 2.96x |
-| Sparse values/comments | 7.81 | 638.9 | 314.3 | 2.03x | 10.44 | 81.12 | 7.77x |
-| Long scalars | 4.79 | 1549.0 | 772.6 | 2.00x | 6.40 | 10.46 | 1.63x |
-
-Across the whole matrix, byte-weighted aggregate throughput is 599.2 MB/s for
-chyaml and 312.2 MB/s for rapidyaml, a 1.92x ratio. The per-workload speed-ratio
-geometric mean is 1.90x; the incremental-memory-ratio geometric mean is 6.16x
-in chyaml's favor. The matrix intentionally reports the weakest result too:
-nested mappings show a 1.16x speed ratio.
-
-These performance scenarios target the portable 8-byte fast event tape. Full
-YAML grammar coverage is tested separately by the 402-case conformance suite;
-small heterogeneous conformance fixtures are not presented as throughput
-measurements. Memory is the observed private-memory increase from the
-post-input baseline through the warm parse, not a process-wide peak.
-
-Reproduce the built-in test:
-
-```sh
-build/release/chyaml_benchmark events 50000 20
-```
-
-Optional comparison targets require a rapidyaml 0.16.0 source checkout only
-for the benchmark executables; it is never linked into `chyaml`:
-
-```sh
-cmake -S . -B build/compare \
-  -DCHYAML_BUILD_COMPARISON=ON \
-  -DCHYAML_RAPIDYAML_SOURCE_DIR=/path/to/rapidyaml \
-  -DCHYAML_OPTIMIZE_FOR=SPEED
-cmake --build build/compare --config Release -j
-build/compare/Release/chyaml_compare 50000 25
-build/compare/Release/rapidyaml_compare 50000 25
-```
-
-The numeric form above is retained for the original single workload. List and
-run an individual added scenario with:
-
-```sh
-build/compare/Release/chyaml_compare --list
-build/compare/Release/chyaml_compare nested_maps 0 25
-build/compare/Release/rapidyaml_compare nested_maps 0 25
-```
-
-Run the isolated paired suite and print both the per-workload table and
-aggregate statistics with:
-
-```sh
-python tests/run_comparison.py \
-  --chyaml build/compare/Release/chyaml_compare.exe \
-  --rapidyaml build/compare/Release/rapidyaml_compare.exe \
-  --runs 9 --iterations 15
-```
-
-When Python 3 is found during configuration, the
-`chyaml_comparison_suite` build target runs the same driver with its shorter
-7-run default.
-
-### Optimization matrix
-
-`chyaml_bench_suite` sweeps eight input shapes across the DOM and event APIs,
-separates parse from emit timing, reports retained memory per scenario in a
-fresh process, and measures concurrent node access. `tests/run_bench_matrix.py`
-runs every mode for one or two binaries and prints the ratios:
-
-```sh
-build/release/chyaml_bench_suite --mode dom --profile fast --csv
-build/release/chyaml_bench_suite --mode parallel --threads 8
-python tests/run_bench_matrix.py \
-  --a build/baseline/chyaml_bench_suite \
-  --b build/release/chyaml_bench_suite --scale 1 --repeats 3 --iterations 3
-```
-
-The comparison below used an Apple M4 Max (macOS 26.1, Apple clang 17,
-Release, `CHYAML_OPTIMIZE_FOR=SPEED`), full-size inputs, and the previous
-revision as the baseline:
-
-| Workload family | Parse speedup | Retained-memory reduction |
-|---|---:|---:|
-| DOM, portable 8-byte event tape | 1.03x - 1.31x | 1.20x - 1.22x |
-| DOM, complete path | 1.33x - 7.22x | 1.19x - 1.86x |
-| Event tape | 1.03x - 1.20x | about 1.00x |
-
-Over the 32 timing cells the geometric-mean speedup is 1.46x; over the 24
-memory cells the geometric-mean reduction is 1.18x. Emission throughput on the
-same inputs improved by about 1.6x - 1.8x. A 3.95 MB stream of 20,000 plain
-documents parses about 2.4x faster with `--mode parallel` and 8 workers, and
-its sequential path also benefits from the per-document arena layout.
+Benchmark results, optimization history, raw measurements, and reproduction
+commands are collected in [PERFORMANCE.md](PERFORMANCE.md#english).
 
 ## SIMD note
 
@@ -311,7 +204,15 @@ passes 405, the exception being an upstream addition that expects
 build/release/chyaml_conformance /path/to/yaml-test-suite
 ```
 
-The current release is verified with MSVC 19.44, GCC 12.2, and Apple clang 17.
+Earlier revisions were verified with MSVC 19.44, GCC 12.2, and Apple clang 17.
+This change passed macOS ARM64 Release, ARM64 ASan/UBSan Debug, and x86_64 SIZE
+builds (x86_64 tests ran through Rosetta). Added CI covers Windows/MSVC,
+Linux/GCC, Linux/Clang, and macOS/AppleClang; those remote jobs have not been
+executed locally.
+
+Set `CHYAML_TEST_SUITE_DIR=/path/to/yaml-test-suite` at configuration time to
+register conformance with CTest. CI pins the 402-case data revision
+`6ad3d2c62885d82fc349026c136ef560838fdf3d`.
 
 ## CMake options
 
@@ -322,6 +223,7 @@ The current release is verified with MSVC 19.44, GCC 12.2, and Apple clang 17.
 | `CHYAML_BUILD_TESTS` | standalone only | Build functional tests |
 | `CHYAML_BUILD_BENCHMARKS` | standalone only | Build speed/memory benchmark |
 | `CHYAML_BUILD_CONFORMANCE` | standalone only | Build the conformance runner |
+| `CHYAML_TEST_SUITE_DIR` | empty | Optional conformance data for CTest when tests and the runner are enabled |
 | `CHYAML_BUILD_SIZE_PROBE` | standalone only | Build linked-size probes |
 | `CHYAML_BUILD_COMPARISON` | `OFF` | Build optional comparison executables |
 

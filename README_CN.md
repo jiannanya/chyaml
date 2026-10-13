@@ -58,7 +58,7 @@ bool consume(std::string_view yaml) {
 
 快速档位识别单文档块映射和序列、紧凑序列映射、普通标量、简单双引号标量、标量流式序列、注释、空行和文档标记。每个事件保存两个 32 位字；标量字节保留在输入中，遍历时通过一次单调扫描恢复行列位置。复用 `event_parser` 会复用事件带容量。
 
-`buffered()` 可判断是否选择了 8 字节事件带。返回 false 时仍会通过原生完整路径支持全部语法。
+`buffered()` 可判断是否选择了直接引用输入的快速事件带。返回 false 时仍会通过完整路径支持全部语法；完整路径保留 DOM，并使用每条 8 字节的节点引用记录事件，在消费时展开为公共 `event`。
 
 `reset_borrowed()` 不拥有输入；解析与事件消费结束前，输入必须存活且地址稳定。需要解析器拥有源数据时使用 `reset_copy()`。
 
@@ -89,7 +89,9 @@ device["settings"].resolve_alias()["enabled"].as_bool(enabled);
 
 DOM 在 arena 中保存稳定节点地址，字符串使用压缩的源/池引用，未修改标量直接借用输入；快路径会精确预分配节点数。主要 API 包括 `find()`、`find_yaml_key()`、`at()`、`pair_at()`、`by_path()`、`tag()`、`anchor()`、`resolve_alias()` 和标量类型转换。
 
-`parse_copy()` 拥有输入副本，`parse_file()` 读取文件。节点句柄不能比所属文档活得更久。
+宽集合使用等距节点步长或显式子节点索引，使 `at()` / `pair_at()` 的随机访问保持常数时间。索引在解析和追加时维护，不在只读访问中创建，支持多个线程同时读取同一个不再修改的文档。
+
+`parse_copy()` 拥有输入副本，`parse_file()` 读取文件。节点句柄不能比所属文档活得更久。设置 `allow_duplicate_keys = false` 时，所有解析入口都会检查重复标量键；该检查使用稳定的字符串偏移进行哈希，避免大映射上的反复遍历。
 
 ## 文档流
 
@@ -133,92 +135,9 @@ if (!doc.emit(output, options)) return false;
 
 可用风格包括 `original`、`block`、`flow`、`flow_one_line`、`pretty`、`json`、`json_one_line` 和 `json_type_preserving`。`emit_to_buffer()` 可写入调用方缓冲区。也可以使用 `create()`、`make_scalar()`、`make_sequence()`、`make_mapping()`、`append()` 和 `set_root()` 直接构造文档。
 
-## 性能快照
+## 性能
 
-测量日期为 2026-08-24，环境是 AMD Ryzen 9 9950X、Windows x64、MSVC 19.44 Release；输入为 4,627,797 字节、包含 50,000 条记录。每个解析器运行在独立进程中；结果取 15 组交替配对运行的中位数，每组执行 25 次稳态解析并复用解析器容量。
-
-| 模式 | 解析/物化速度 | 观测私有增量内存 | 单元 |
-|---|---:|---:|---:|
-| chyaml 可移植 8 字节事件带 | 约 391 MB/s | 约 6.18 MB | 750,009 个事件 |
-| rapidyaml 0.16.0 arena 树 | 约 184 MB/s | 约 81.49 MB | 450,003 个节点 |
-
-在该工作负载上，chyaml 事件带约快 2.13 倍，增量内存约小 13.18 倍。Release 链接空间探针中，完整 chyaml DOM API 约 110 KB，对比树 API 约 127 KB。两者的数据结构和访问模式不同，因此这些结果描述的是该工作负载，不代表语义完全相同或所有输入上的普遍性能。
-
-上述原始负载继续作为内置单一工作负载基准保留。新增的第二套测试覆盖 8 种输入形态。下表仍使用相同机器和工具链；每个场景执行 9 组交替配对运行，每个进程样本进行 15 次稳态解析。每个样本都启动新进程，两个可执行文件编译并使用同一份共享输入生成器。
-
-| 工作负载 | 输入 MiB | chyaml MB/s | rapidyaml MB/s | 速度比 | chyaml 内存 MiB | rapidyaml 内存 MiB | 内存比 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| 混合记录 | 4.41 | 396.1 | 184.9 | 2.14x | 5.90 | 77.15 | 13.07x |
-| 扁平映射 | 4.77 | 682.7 | 316.1 | 2.16x | 6.37 | 42.01 | 6.59x |
-| 标量序列 | 6.82 | 882.6 | 458.5 | 1.92x | 9.11 | 44.05 | 4.84x |
-| 嵌套映射 | 3.27 | 316.4 | 272.8 | 1.16x | 4.38 | 39.92 | 9.12x |
-| 流式序列 | 5.14 | 310.0 | 152.7 | 2.03x | 10.31 | 150.01 | 14.55x |
-| 引号字符串 | 6.50 | 1436.1 | 733.2 | 1.96x | 8.69 | 25.71 | 2.96x |
-| 稀疏值/注释 | 7.81 | 638.9 | 314.3 | 2.03x | 10.44 | 81.12 | 7.77x |
-| 长标量 | 4.79 | 1549.0 | 772.6 | 2.00x | 6.40 | 10.46 | 1.63x |
-
-整个矩阵按输入字节加权后的综合吞吐为 chyaml 599.2 MB/s、rapidyaml 312.2 MB/s，速度比 1.92 倍。各工作负载速度比的几何平均值为 1.90 倍，增量内存比的几何平均值为 chyaml 小 6.16 倍。矩阵也明确保留最弱结果：嵌套映射的速度比为 1.16 倍。
-
-这些性能场景针对可移植 8 字节快速事件带。完整 YAML 语法由独立的 402 项规范套件验证；体积很小且差异很大的规范样例不被包装成吞吐数据。内存值是从输入生成完成后的基线到预热解析后的观测私有内存增量，不是进程全生命周期峰值。
-
-复现内置基准：
-
-```sh
-build/release/chyaml_benchmark events 50000 20
-```
-
-可选对比目标仅在基准可执行文件中需要 rapidyaml 0.16.0 源码，不会链接到 `chyaml`：
-
-```sh
-cmake -S . -B build/compare \
-  -DCHYAML_BUILD_COMPARISON=ON \
-  -DCHYAML_RAPIDYAML_SOURCE_DIR=/path/to/rapidyaml \
-  -DCHYAML_OPTIMIZE_FOR=SPEED
-cmake --build build/compare --config Release -j
-build/compare/Release/chyaml_compare 50000 25
-build/compare/Release/rapidyaml_compare 50000 25
-```
-
-以上数字参数形式继续用于原来的单一工作负载。列出并单独运行新增场景：
-
-```sh
-build/compare/Release/chyaml_compare --list
-build/compare/Release/chyaml_compare nested_maps 0 25
-build/compare/Release/rapidyaml_compare nested_maps 0 25
-```
-
-用独立进程运行交替配对综合套件，并打印逐场景表格与综合统计：
-
-```sh
-python tests/run_comparison.py \
-  --chyaml build/compare/Release/chyaml_compare.exe \
-  --rapidyaml build/compare/Release/rapidyaml_compare.exe \
-  --runs 9 --iterations 15
-```
-
-配置阶段找到 Python 3 时，还会提供 `chyaml_comparison_suite` 构建目标，以较短的默认 7 组运行执行同一驱动器。
-
-### 优化对照矩阵
-
-`chyaml_bench_suite` 覆盖八种输入形态，分别测量 DOM 与事件 API，把解析与输出计时分离，在独立进程中报告每个场景的增量内存，并测量并发节点访问。`tests/run_bench_matrix.py` 可对一两个二进制运行全部模式并打印比值：
-
-```sh
-build/release/chyaml_bench_suite --mode dom --profile fast --csv
-build/release/chyaml_bench_suite --mode parallel --threads 8
-python tests/run_bench_matrix.py \
-  --a build/baseline/chyaml_bench_suite \
-  --b build/release/chyaml_bench_suite --scale 1 --repeats 3 --iterations 3
-```
-
-下表的对照环境为 Apple M4 Max（macOS 26.1、Apple clang 17、Release、`CHYAML_OPTIMIZE_FOR=SPEED`），输入为完整规模，基线为上一版本：
-
-| 工作负载类别 | 解析加速 | 增量内存降低 |
-|---|---:|---:|
-| DOM，可移植 8 字节事件带 | 1.03x - 1.31x | 1.20x - 1.22x |
-| DOM，完整路径 | 1.33x - 7.22x | 1.19x - 1.86x |
-| 事件带 | 1.03x - 1.20x | 约 1.00x |
-
-32 个计时单元的几何平均加速为 1.46x；24 个内存单元的几何平均降低为 1.18x。同一批输入的输出吞吐提升约 1.6x - 1.8x。3.95 MB、20,000 个纯量文档组成的流在 `--mode parallel`、8 个工作线程下约快 2.4 倍，其顺序路径也从按文档的 arena 布局中获益。
+基准结果、性能优化记录、原始测量数据和复现命令统一记录在 [PERFORMANCE.md](PERFORMANCE.md#中文)。
 
 ## SIMD 说明
 
@@ -234,7 +153,9 @@ chyaml 使用可移植纯标量 C++20，主动避免平台专用 SIMD/目标调�
 build/release/chyaml_conformance /path/to/yaml-test-suite
 ```
 
-当前版本已使用 MSVC 19.44、GCC 12.2 和 Apple clang 17 验证。
+此前版本已使用 MSVC 19.44、GCC 12.2 和 Apple clang 17 验证。本次改动在 macOS 的 ARM64 Release、ARM64 ASan/UBSan Debug 和 x86_64 SIZE 构建上通过测试；x86_64 测试通过 Rosetta 执行。新增 CI 覆盖 Windows/MSVC、Linux/GCC、Linux/Clang 和 macOS/AppleClang，远程 CI 尚未在本地执行。
+
+可通过 `-DCHYAML_TEST_SUITE_DIR=/path/to/yaml-test-suite` 将规范套件加入 CTest。CI 固定使用数据版本 `6ad3d2c62885d82fc349026c136ef560838fdf3d`，包含 402 项。
 
 ## CMake 选项
 
@@ -245,6 +166,7 @@ build/release/chyaml_conformance /path/to/yaml-test-suite
 | `CHYAML_BUILD_TESTS` | 仅顶层构建开启 | 构建功能测试 |
 | `CHYAML_BUILD_BENCHMARKS` | 仅顶层构建开启 | 构建速度/内存基准 |
 | `CHYAML_BUILD_CONFORMANCE` | 仅顶层构建开启 | 构建规范运行器 |
+| `CHYAML_TEST_SUITE_DIR` | 空 | 可选规范数据目录；在测试和规范运行器开启时加入 CTest |
 | `CHYAML_BUILD_SIZE_PROBE` | 仅顶层构建开启 | 构建链接空间探针 |
 | `CHYAML_BUILD_COMPARISON` | `OFF` | 构建可选对比可执行文件 |
 

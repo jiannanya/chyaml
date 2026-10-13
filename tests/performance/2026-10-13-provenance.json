@@ -1,0 +1,41 @@
+{
+  "baseline_commit": "bdf05a6",
+  "source_sha256": {
+    "baseline": "c4dad1e0436fc720d4d8efc8ae79c4f84817abc38be56f0fc14269775a9e5ae5",
+    "previous": "429e1637aa7af03677c5143d961e650a90129fb221f866e93b99ae77916c3b90",
+    "candidate": "56360d4469d30880f0c6e83e775b8f939a58154edda6232156fe8bed68d3fdc3"
+  },
+  "public_header_sha256": "152cfcad16a968e68aef70682f36ac87d9003902e2bff8685f2a3b96aca75fd6",
+  "build": {
+    "compiler": "Apple clang 17",
+    "architecture": "ARM64",
+    "configuration": "Release",
+    "CHYAML_OPTIMIZE_FOR": "SPEED",
+    "CHYAML_ENABLE_IPO": "ON"
+  },
+  "preserved_checks": {
+    "hotpaths": {
+      "entries": 5000,
+      "repeats": 5,
+      "runs": 6,
+      "statistic": "median of per-process medians; all six binary orderings"
+    },
+    "memory_events_compact": {
+      "scale_divisor": 2,
+      "runs": 3,
+      "statistic": "median retained-byte delta; separate process for each measurement"
+    }
+  },
+  "linked_probe_bytes": {
+    "chyaml_size_probe": {
+      "baseline": 110448,
+      "previous": 111216,
+      "candidate": 111136
+    },
+    "chyaml_event_size_probe": {
+      "baseline": 110312,
+      "previous": 111240,
+      "candidate": 111160
+    }
+  }
+}

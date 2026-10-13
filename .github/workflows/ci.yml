@@ -1,0 +1,67 @@
+name: Portable C++20
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: GCC
+            flags: -DCMAKE_CXX_COMPILER=g++
+          - os: ubuntu-latest
+            compiler: Clang
+            flags: -DCMAKE_CXX_COMPILER=clang++
+          - os: windows-latest
+            compiler: MSVC
+            flags: ""
+          - os: macos-latest
+            compiler: AppleClang
+            flags: ""
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} / ${{ matrix.compiler }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preserve conformance fixture bytes
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          repository: yaml/yaml-test-suite
+          ref: 6ad3d2c62885d82fc349026c136ef560838fdf3d
+          path: .cache/yaml-test-suite
+      - name: Configure
+        run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DCHYAML_OPTIMIZE_FOR=SPEED
+          -DCHYAML_TEST_SUITE_DIR="${{ github.workspace }}/.cache/yaml-test-suite"
+          ${{ matrix.flags }}
+      - name: Build
+        run: cmake --build build --config Release --parallel 2
+      - name: Functional and conformance tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preserve conformance fixture bytes
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          repository: yaml/yaml-test-suite
+          ref: 6ad3d2c62885d82fc349026c136ef560838fdf3d
+          path: .cache/yaml-test-suite
+      - name: Configure
+        run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DCHYAML_ENABLE_IPO=OFF -DCHYAML_BUILD_BENCHMARKS=OFF
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          -DCHYAML_TEST_SUITE_DIR="${{ github.workspace }}/.cache/yaml-test-suite"
+      - name: Build and test
+        run: cmake --build build --parallel 2 && ctest --test-dir build --output-on-failure

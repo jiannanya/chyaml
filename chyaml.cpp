@@ -16,6 +16,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -68,12 +69,13 @@ struct node_data {
     // bare collections, 2 for plain mappings, and so on). Random access then
     // costs one multiply and one bounds check instead of walking the sibling
     // chain. A zero stride simply means "unknown" and the sibling walk is used;
-    // the field is filled in once after parsing and reset whenever the child
-    // list is mutated.
+    // the field is maintained on append. When indexed_children is set, it is
+    // instead the slot of an explicit index in the owner's child_indices.
     std::uint32_t child_stride{};
     node_type type_value{node_type::scalar};
     node_style style_value{node_style::plain};
     bool modified{};
+    bool indexed_children{};
 
     node_type kind() const noexcept { return type_value; }
     void set_kind(node_type value) noexcept { type_value = value; }
@@ -188,6 +190,9 @@ struct document_state {
     // Empty for documents without them, which keeps plain parses allocation-free
     // beyond the node arena.
     std::vector<node_properties> properties{};
+    // Only wide, irregular collections need explicit child indices. Built on
+    // append, so const access stays allocation-free and safe across readers.
+    std::vector<std::vector<std::uint32_t>> child_indices{};
     std::uint32_t root{no_index};
     std::size_t original_begin{};
     std::size_t original_end{};
@@ -255,19 +260,52 @@ struct document_state {
             // the append path stays free of extra work for the common case: a
             // mapping with a handful of keys is cheap to walk anyway.
             if (parent->child_count >= stride_index_threshold) {
-                if (parent->child_count == stride_index_threshold) {
-                    seed_child_stride(parent);
-                } else if (parent->child_stride != 0) {
+                if (!parent->indexed_children && parent->child_stride != 0) {
                     const auto delta = static_cast<std::int64_t>(child->index) -
                                        static_cast<std::int64_t>(previous->index);
-                    if (delta != static_cast<std::int64_t>(parent->child_stride))
+                    if (delta != static_cast<std::int64_t>(parent->child_stride)) {
                         parent->child_stride = 0;
+                        index_children(parent);
+                    }
+                } else {
+                    extend_child_index(parent, child->index);
                 }
             }
         }
         parent->last_child = child->index;
         ++parent->child_count;
         return true;
+    }
+
+    // Keep allocation and exception handling out of append_child's regular
+    // path, so callers can inline it without the irregular-index machinery.
+    void extend_child_index(node_data* parent, std::uint32_t child) noexcept {
+        if (parent->indexed_children) {
+            try {
+                child_indices[parent->child_stride].push_back(child);
+            } catch (...) {
+                parent->indexed_children = false;
+                parent->child_stride = 0;
+            }
+        } else {
+            if (parent->child_count == stride_index_threshold) seed_child_stride(parent);
+            if (parent->child_stride == 0) index_children(parent);
+        }
+    }
+
+    void index_children(node_data* parent) noexcept {
+        try {
+            std::vector<std::uint32_t> indices;
+            indices.reserve(static_cast<std::size_t>(parent->child_count) + 1);
+            for (auto index = parent->first_child; index != no_index;
+                 index = nodes.at(index)->next_sibling) indices.push_back(index);
+            const auto slot = static_cast<std::uint32_t>(child_indices.size());
+            child_indices.push_back(std::move(indices));
+            parent->child_stride = slot;
+            parent->indexed_children = true;
+        } catch (...) {
+            // append() is noexcept; indexing is optional on allocation failure.
+        }
     }
 
     // Derives the regular-stride hint for a collection that just grew past the
@@ -476,6 +514,21 @@ constexpr byte_table<classify_quoted> quoted_class{};
 constexpr byte_table<classify_yaml_quoted> yaml_quoted_class{};
 constexpr byte_table<classify_colon> colon_class{};
 
+// Scan ordinary text four bytes at a time, without alignment, endian, or SIMD
+// assumptions. Stop at the first byte requiring the caller's grammar rules.
+const char* skip_ordinary(const char* cursor, const char* limit,
+                          const std::uint8_t* classes) noexcept {
+    while (limit - cursor >= 4 &&
+           (classes[static_cast<unsigned char>(cursor[0])] |
+            classes[static_cast<unsigned char>(cursor[1])] |
+            classes[static_cast<unsigned char>(cursor[2])] |
+            classes[static_cast<unsigned char>(cursor[3])]) == 0)
+        cursor += 4;
+    while (cursor != limit && classes[static_cast<unsigned char>(*cursor)] == 0)
+        ++cursor;
+    return cursor;
+}
+
 class yaml_parser {
 public:
     yaml_parser(std::string_view source, std::shared_ptr<std::string> owner,
@@ -592,7 +645,8 @@ private:
     node_data* parse_plain(std::size_t& index, std::size_t start, std::size_t end,
                            std::size_t parent_indent, bool key_context);
     node_data* parse_quoted(std::size_t& index, std::size_t start, char quote,
-                            bool flow = false, std::size_t parent_indent = 0);
+                            bool flow = false, std::size_t parent_indent = 0,
+                            std::size_t* after = nullptr);
     node_data* parse_block_scalar(std::size_t& index, std::size_t start,
                                   std::size_t end, std::size_t parent_indent);
 
@@ -608,8 +662,31 @@ private:
     node_data* make_empty(std::size_t line, std::size_t column);
     node_data* make_scalar(text_ref text, node_style style,
                            std::size_t absolute);
+    node_data* make_scalar_at(text_ref text, node_style style,
+                              std::size_t line, std::size_t column);
     bool add_pair(node_data* mapping, node_data* key, node_data* value);
-    bool duplicate_key(node_data* mapping, node_data* key) const;
+    struct scalar_key {
+        std::uint32_t mapping{};
+        text_ref text{};
+    };
+    struct scalar_key_hash {
+        const document_state* document{};
+        std::size_t operator()(const scalar_key& key) const noexcept {
+            return std::hash<std::string_view>{}(document->view(key.text)) ^
+                   (static_cast<std::size_t>(key.mapping) * 0x9e3779b9U);
+        }
+    };
+    struct scalar_key_equal {
+        const document_state* document{};
+        bool operator()(const scalar_key& a, const scalar_key& b) const noexcept {
+            return a.mapping == b.mapping &&
+                   document->view(a.text) == document->view(b.text);
+        }
+    };
+    // Offsets survive pool growth when quoted or folded keys are decoded.
+    std::unordered_set<scalar_key, scalar_key_hash, scalar_key_equal> scalar_keys_{
+        0, scalar_key_hash{}, scalar_key_equal{}};
+    bool duplicate_key(node_data* mapping, node_data* key);
 };
 
 } // namespace detail
@@ -648,6 +725,10 @@ detail::node_data* data_of(const node& value) noexcept {
 const detail::node_data* child_at(const detail::node_data* parent,
                                   std::size_t requested) noexcept {
     if (!parent || requested >= parent->child_count) return nullptr;
+    if (parent->indexed_children) {
+        return parent->owner->nodes.at(
+            parent->owner->child_indices[parent->child_stride][requested]);
+    }
     if (parent->child_stride != 0) {
         // Validated during indexing, so this is the k-th child directly. The
         // parent check guards against a stale hint on a mutated collection.
@@ -672,8 +753,8 @@ const detail::node_data* child_at(const detail::node_data* parent,
 class text_writer {
 public:
     explicit text_writer(std::string& sink, std::size_t reserve_bytes) : sink_(&sink) {
-        sink_->clear();
         if (reserve_bytes < minimum_capacity) reserve_bytes = minimum_capacity;
+        reserve_bytes = (std::max)(reserve_bytes, sink_->size());
         sink_->resize(reserve_bytes);
         cursor_ = sink_->data();
         limit_ = cursor_ + reserve_bytes;
@@ -740,7 +821,12 @@ bool scalar_needs_quotes(std::string_view value) noexcept {
     if (value == "null" || value == "Null" || value == "NULL" || value == "~" ||
         value == "true" || value == "True" || value == "TRUE" ||
         value == "false" || value == "False" || value == "FALSE") return true;
+    const char* const limit = value.data() + value.size();
     for (std::size_t i = 0; i < value.size(); ++i) {
+        const char* special = detail::skip_ordinary(value.data() + i, limit,
+                                                   detail::scalar_class.values);
+        if (special == limit) break;
+        i = static_cast<std::size_t>(special - value.data());
         const auto kind = detail::scalar_class.values[
             static_cast<unsigned char>(value[i])];
         if (kind == 1) return true;
@@ -762,11 +848,9 @@ void append_quoted(text_writer& output, std::string_view value, bool json = fals
     const char* const limit = cursor + value.size();
     const char* run = cursor;
     while (cursor != limit) {
+        cursor = detail::skip_ordinary(cursor, limit, classes);
+        if (cursor == limit) break;
         const auto c = static_cast<unsigned char>(*cursor);
-        if (classes[c] == 0) {
-            ++cursor;
-            continue;
-        }
         if (run != cursor) output.put(run, static_cast<std::size_t>(cursor - run));
         switch (c) {
         case '"': output.put("\\\""); break;
@@ -935,37 +1019,65 @@ struct emitter {
     }
 };
 
-void collect_events(const detail::node_data* value, std::vector<event>& output) {
+// Full-path events refer to stable arena nodes instead of duplicating string
+// views and locations. Document markers carry a document index. Expansion into
+// the public event happens only when consumed (or inspected through the native
+// handle), keeping each retained event at eight bytes on every platform.
+struct node_event_record {
+    std::uint32_t index{};
+    event_type type{};
+};
+static_assert(sizeof(node_event_record) == 8);
+
+void collect_events(const detail::node_data* value,
+                    std::vector<node_event_record>& output) {
     if (!value) return;
-    event current;
-    current.style = value->presentation();
-    current.tag = value->owner->view(detail::tag_ref(value));
-    current.anchor = value->owner->view(detail::anchor_ref(value));
-    current.line = value->line;
-    current.column = value->column;
     if (value->kind() == node_type::scalar) {
-        current.type = value->presentation() == node_style::alias ? event_type::alias : event_type::scalar;
-        current.value = value->owner->view(value->scalar);
-        output.push_back(current);
+        output.push_back({value->index, value->presentation() == node_style::alias
+            ? event_type::alias : event_type::scalar});
         return;
     }
-    current.type = value->kind() == node_type::mapping ? event_type::mapping_start
-                                                     : event_type::sequence_start;
-    output.push_back(current);
+    const bool mapping = value->kind() == node_type::mapping;
+    output.push_back({value->index, mapping ? event_type::mapping_start
+                                           : event_type::sequence_start});
     for (auto index = value->first_child; index != detail::no_index;) {
         const auto* child = value->owner->nodes.at(index);
-        if (value->kind() == node_type::mapping)
-            collect_events(value->owner->nodes.at(child->key), output);
+        if (mapping) collect_events(value->owner->nodes.at(child->key), output);
         collect_events(child, output);
         index = child->next_sibling;
     }
-    current = {};
-    current.type = value->kind() == node_type::mapping ? event_type::mapping_end
-                                                     : event_type::sequence_end;
-    current.style = value->presentation();
-    current.line = value->line;
-    current.column = value->column;
-    output.push_back(current);
+    output.push_back({value->index, mapping ? event_type::mapping_end
+                                           : event_type::sequence_end});
+}
+
+void expand_event(const node_event_record& record,
+                  const detail::document_state* document, event& output) noexcept {
+    output = {};
+    output.type = record.type;
+    if (record.type == event_type::stream_start) {
+        output.line = output.column = 1;
+    } else if (record.type == event_type::document_start) {
+        const auto* root = document->nodes.at(document->root);
+        output.line = root ? root->line : 1;
+        output.column = root ? root->column : 1;
+        output.implicit = !document->explicit_start;
+    } else if (record.type == event_type::document_end) {
+        output.line = document->end_line;
+        output.column = document->end_column;
+        output.implicit = !document->explicit_end;
+    } else if (record.type != event_type::stream_end) {
+        const auto* value = document->nodes.at(record.index);
+        output.style = value->presentation();
+        output.line = value->line;
+        output.column = value->column;
+        if (record.type != event_type::mapping_end &&
+            record.type != event_type::sequence_end) {
+            output.tag = document->view(detail::tag_ref(value));
+            output.anchor = document->view(detail::anchor_ref(value));
+            if (value->kind() == node_type::scalar)
+                output.value = document->view(value->scalar);
+        }
+    }
 }
 
 struct fast_event_record {
@@ -1140,7 +1252,13 @@ private:
     bool safe_plain(fast_fragment value) const noexcept {
         const auto* const bytes = reinterpret_cast<const unsigned char*>(
             input_.data() + value.offset);
+        const char* const base = input_.data() + value.offset;
+        const char* const limit = base + value.length;
         for (std::size_t i = 0; i < value.length; ++i) {
+            const char* special = detail::skip_ordinary(base + i, limit,
+                                                       detail::fast_class.values);
+            if (special == limit) break;
+            i = static_cast<std::size_t>(special - base);
             const auto kind = detail::fast_class.values[bytes[i]];
             if (kind == 1) return false;
             if (kind == 2 && (i == 0 || bytes[i - 1] == ' ')) return false;
@@ -1150,7 +1268,13 @@ private:
     bool prepare_plain_value(fast_fragment& value) const noexcept {
         const auto* const bytes = reinterpret_cast<const unsigned char*>(
             input_.data() + value.offset);
+        const char* const base = input_.data() + value.offset;
+        const char* const limit = base + value.length;
         for (std::size_t i = 0; i < value.length; ++i) {
+            const char* special = detail::skip_ordinary(base + i, limit,
+                                                       detail::fast_class.values);
+            if (special == limit) break;
+            i = static_cast<std::size_t>(special - base);
             const auto kind = detail::fast_class.values[bytes[i]];
             if (kind == 1) return false;
             if (kind == 2 && (i == 0 || bytes[i - 1] == ' ')) {
@@ -1405,16 +1529,21 @@ struct stream_parser::impl {
 };
 
 struct event_parser::impl {
-    detail::parse_result parsed{};
-    std::vector<event> events{};
-    std::shared_ptr<std::string> source_owner{};
+    // Keep the tape cursor together; full-path document ownership and native
+    // previews are not touched while consuming buffered events.
     std::string_view fast_input{};
     std::vector<fast_event_record> fast_events{};
     std::size_t next{};
     std::size_t scan_offset{};
     std::size_t scan_line{1};
     std::size_t scan_line_start{};
+    std::size_t next_newline{std::string_view::npos};
     bool buffered{};
+    detail::parse_result parsed{};
+    std::vector<node_event_record> events{};
+    const detail::document_state* event_document{};
+    std::shared_ptr<std::string> source_owner{};
+    event native_event{};
 };
 
 node_type node::type() const noexcept {
@@ -1687,7 +1816,7 @@ bool document::parse_borrowed(std::string_view yaml, parse_options options) {
     if (!impl_) return false;
     impl_->options = options;
     if (options.profile == parse_profile::fast && !options.preserve_comments &&
-        !options.resolve_aliases) {
+        !options.resolve_aliases && options.allow_duplicate_keys) {
         impl_->state = build_fast_document(yaml, {});
         if (impl_->state) return true;
     }
@@ -1709,7 +1838,7 @@ bool document::parse_owned(std::shared_ptr<std::string> owner, parse_options opt
     if (!impl_) return false;
     impl_->options = options;
     if (options.profile == parse_profile::fast && !options.preserve_comments &&
-        !options.resolve_aliases) {
+        !options.resolve_aliases && options.allow_duplicate_keys) {
         impl_->state = build_fast_document(*owner, owner);
         if (impl_->state) return true;
     }
@@ -1780,8 +1909,10 @@ bool document::resolve_aliases() {
 }
 
 bool document::emit(std::string& output, emit_options options) const {
-    output.clear();
-    if (!impl_ || !impl_->state || impl_->state->root == detail::no_index) return false;
+    if (!impl_ || !impl_->state || impl_->state->root == detail::no_index) {
+        output.clear();
+        return false;
+    }
     const auto& state = *impl_->state;
     if (!state.dirty && options.style == emit_style::original &&
         options.output_comments && !options.sort_keys) {
@@ -1798,11 +1929,12 @@ bool document::emit(std::string& output, emit_options options) const {
         return true;
     }
     emitter writer{options, nullptr};
-    // Emission writes at least one byte per input byte for the original and
-    // block styles, so one reservation removes the geometric regrowth (and its
-    // repeated copying) for large documents.
+    // A stream document shares the entire input but emits only its own span.
+    // Reuse initialized string storage; clearing before resize would zero every
+    // output byte again on each emit. Constructed documents use their pool size.
+    const std::size_t source_bytes = state.original_end - state.original_begin;
     const std::size_t reserve_bytes =
-        state.source.size() + state.source.size() / 4 + 64;
+        (std::max)(source_bytes, state.pool.size()) + 64;
     text_writer buffer(output, reserve_bytes);
     writer.output = &buffer;
     writer.write(state.nodes.at(state.root));
@@ -2134,6 +2266,8 @@ bool reset_events(Storage*& storage, std::string_view yaml,
     storage->parsed.documents.clear();
     storage->parsed.error = {};
     storage->events.clear();
+    storage->event_document = nullptr;
+    storage->native_event = {};
     storage->fast_events.clear();
     storage->next = 0;
     storage->scan_offset = 0;
@@ -2143,10 +2277,11 @@ bool reset_events(Storage*& storage, std::string_view yaml,
     storage->source_owner = owner;
     storage->fast_input = yaml;
     if (options.profile == parse_profile::fast && !options.preserve_comments &&
-        !options.resolve_aliases) {
+        !options.resolve_aliases && options.allow_duplicate_keys) {
         fast_event_builder fast(yaml, storage->fast_events);
         if (fast.build()) {
             storage->buffered = true;
+            storage->next_newline = yaml.find('\n');
             return true;
         }
     }
@@ -2164,30 +2299,15 @@ bool reset_events(Storage*& storage, std::string_view yaml,
     for (const auto& document : storage->parsed.documents)
         estimated_events += document->nodes.size() * 2 + 2;
     storage->events.reserve(estimated_events);
-    event start;
-    start.type = event_type::stream_start;
-    start.line = 1;
-    start.column = 1;
-    storage->events.push_back(start);
-    for (const auto& document : storage->parsed.documents) {
-        event document_start;
-        document_start.type = event_type::document_start;
-        const auto* root = document->nodes.at(document->root);
-        document_start.line = root ? root->line : 1;
-        document_start.column = root ? root->column : 1;
-        document_start.implicit = !document->explicit_start;
-        storage->events.push_back(document_start);
-        collect_events(root, storage->events);
-        event document_end;
-        document_end.type = event_type::document_end;
-        document_end.line = document->end_line;
-        document_end.column = document->end_column;
-        document_end.implicit = !document->explicit_end;
-        storage->events.push_back(document_end);
+    storage->events.push_back({0, event_type::stream_start});
+    for (std::size_t i = 0; i < storage->parsed.documents.size(); ++i) {
+        const auto& document = storage->parsed.documents[i];
+        const auto index = static_cast<std::uint32_t>(i);
+        storage->events.push_back({index, event_type::document_start});
+        collect_events(document->nodes.at(document->root), storage->events);
+        storage->events.push_back({index, event_type::document_end});
     }
-    event finish;
-    finish.type = event_type::stream_end;
-    storage->events.push_back(finish);
+    storage->events.push_back({0, event_type::stream_end});
     return !storage->events.empty();
 }
 
@@ -2210,37 +2330,42 @@ bool event_parser::reset_file(std::string_view path, parse_options options) {
 }
 
 event_status event_parser::next(event& output) {
-    output = {};
-    if (!impl_) return event_status::end;
+    if (!impl_) { output = {}; return event_status::end; }
     if (impl_->buffered) {
-        if (impl_->next >= impl_->fast_events.size()) return event_status::end;
+        if (impl_->next >= impl_->fast_events.size()) {
+            output = {};
+            return event_status::end;
+        }
         const auto& source = impl_->fast_events[impl_->next++];
-        output.type = source.type();
-        output.style = source.style();
-        output.implicit = source.implicit();
         const std::size_t location = source.offset;
         if (location < impl_->scan_offset) {
-            impl_->scan_offset = 0;
             impl_->scan_line = 1;
             impl_->scan_line_start = 0;
+            impl_->next_newline = impl_->fast_input.find('\n');
         }
-        while (impl_->scan_offset < location) {
-            if (impl_->fast_input[impl_->scan_offset] == '\n') {
-                ++impl_->scan_line;
-                impl_->scan_line_start = impl_->scan_offset + 1;
-            }
-            ++impl_->scan_offset;
+        // Scan each physical line once, regardless of the number of events on
+        // it. The next newline is a bound shared by all events on that line.
+        while (impl_->next_newline < location) {
+            ++impl_->scan_line;
+            impl_->scan_line_start = impl_->next_newline + 1;
+            impl_->next_newline = impl_->fast_input.find('\n', impl_->scan_line_start);
         }
-        output.line = impl_->scan_line;
-        output.column = location - impl_->scan_line_start + 1;
-        if (output.type == event_type::scalar)
-            output.value = impl_->fast_input.substr(source.offset, source.length());
+        impl_->scan_offset = location;
+        const auto type = source.type();
+        const auto value = type == event_type::scalar
+            ? impl_->fast_input.substr(source.offset, source.length()) : std::string_view{};
+        output = {type, source.style(), value, {}, {}, impl_->scan_line,
+                  location - impl_->scan_line_start + 1, source.implicit()};
         return event_status::event;
     }
     if (impl_->next < impl_->events.size()) {
-        output = impl_->events[impl_->next++];
+        const auto& record = impl_->events[impl_->next++];
+        if (record.type == event_type::document_start)
+            impl_->event_document = impl_->parsed.documents[record.index].get();
+        expand_event(record, impl_->event_document, output);
         return event_status::event;
     }
+    output = {};
     return impl_->parsed.error ? event_status::error : event_status::end;
 }
 
@@ -2262,7 +2387,12 @@ void* event_parser::native_event_handle() const noexcept {
     if (impl_->buffered)
         return impl_->next < impl_->fast_events.size() ? &impl_->fast_events[impl_->next]
                                                        : nullptr;
-    return impl_->next < impl_->events.size() ? &impl_->events[impl_->next] : nullptr;
+    if (impl_->next >= impl_->events.size()) return nullptr;
+    const auto& record = impl_->events[impl_->next];
+    const auto* document = record.type == event_type::document_start
+        ? impl_->parsed.documents[record.index].get() : impl_->event_document;
+    expand_event(record, document, impl_->native_event);
+    return &impl_->native_event;
 }
 
 } // namespace chyaml
@@ -2566,6 +2696,10 @@ std::unique_ptr<document_state> yaml_parser::parse_document(
     state->preserve_comments = options_.preserve_comments;
     document_ = state.get();
     anchors_.clear();
+    if (!options_.allow_duplicate_keys) {
+        scalar_keys_ = decltype(scalar_keys_)(0, scalar_key_hash{document_},
+                                             scalar_key_equal{document_});
+    }
 
     line_index_ = next_content(line_index_);
     if (line_index_ >= lines_.size() || marker(line_index_, "...") ||
@@ -2608,6 +2742,11 @@ node_data* yaml_parser::make_empty(std::size_t line, std::size_t column) {
 node_data* yaml_parser::make_scalar(text_ref text, node_style style,
                                     std::size_t absolute) {
     const auto [line, column] = location(absolute);
+    return make_scalar_at(text, style, line, column);
+}
+
+node_data* yaml_parser::make_scalar_at(text_ref text, node_style style,
+                                       std::size_t line, std::size_t column) {
     node_data* value = document_->create_node(node_type::scalar, style, line, column);
     if (!value || !text.valid()) {
         fail("out of memory", line, column);
@@ -2628,17 +2767,9 @@ bool yaml_parser::add_pair(node_data* mapping, node_data* key, node_data* value)
     return document_->append_child(mapping, value);
 }
 
-bool yaml_parser::duplicate_key(node_data* mapping, node_data* key) const {
+bool yaml_parser::duplicate_key(node_data* mapping, node_data* key) {
     if (!mapping || !key || key->kind() != node_type::scalar) return false;
-    const auto requested = document_->view(key->scalar);
-    for (auto index = mapping->first_child; index != no_index;) {
-        const auto* value = document_->nodes.at(index);
-        const auto* existing = document_->nodes.at(value->key);
-        if (existing && existing->kind() == node_type::scalar &&
-            document_->view(existing->scalar) == requested) return true;
-        index = value->next_sibling;
-    }
-    return false;
+    return !scalar_keys_.insert({mapping->index, key->scalar}).second;
 }
 
 std::size_t yaml_parser::strip_comment(std::size_t start, std::size_t end) const noexcept {
@@ -3144,7 +3275,9 @@ node_data* yaml_parser::parse_value(std::size_t& index, std::size_t start,
     }
 
     std::size_t position = start;
-    const properties props = parse_properties(position, end);
+    properties props;
+    if (source_[position] == '&' || source_[position] == '!')
+        props = parse_properties(position, end);
     if (has_error()) return nullptr;
     while (position < end && is_space(source_[position])) ++position;
     if (position == end) {
@@ -3228,7 +3361,7 @@ node_data* yaml_parser::parse_value(std::size_t& index, std::size_t start,
     } else {
         value = parse_plain(index, position, end, parent_indent, key_context);
     }
-    if (!has_error()) apply_properties(value, props);
+    if (props.any && !has_error()) apply_properties(value, props);
     return value;
 }
 
@@ -3328,8 +3461,10 @@ node_data* yaml_parser::parse_plain(std::size_t& index, std::size_t start,
         if (continued_end != continuation.end) break;
     }
     index = multiline ? next : first_line + 1;
-    if (multiline) return make_scalar(document_->pooled_text(decoded), node_style::plain, start);
-    return make_scalar(document_->source_text(start, end - start), node_style::plain, start);
+    const auto text = multiline ? document_->pooled_text(decoded)
+                               : document_->source_text(start, end - start);
+    const auto& info = lines_[first_line];
+    return make_scalar_at(text, node_style::plain, info.number, start - info.start + 1);
 }
 
 namespace {
@@ -3363,7 +3498,38 @@ int hex_value(char value) noexcept {
 } // namespace
 
 node_data* yaml_parser::parse_quoted(std::size_t& index, std::size_t start, char quote,
-                                    bool flow, std::size_t parent_indent) {
+                                    bool flow, std::size_t parent_indent,
+                                    std::size_t* after) {
+    // Most quoted scalars need neither decoding nor owned storage. Bound the
+    // probe to this physical line so malformed/multiline input is scanned only
+    // by the complete decoder below.
+    const std::size_t begin = start + 1;
+    const std::size_t line_end = lines_[index].end;
+    const void* found = std::memchr(source_.data() + begin, quote, line_end - begin);
+    if (found) {
+        const auto end = static_cast<std::size_t>(
+            static_cast<const char*>(found) - source_.data());
+        const bool doubled = quote == '\'' && end + 1 < source_.size() &&
+                             source_[end + 1] == '\'';
+        if (!doubled &&
+            (quote != '"' || !std::memchr(source_.data() + begin, '\\', end - begin)) &&
+            !std::memchr(source_.data() + begin, '\r', end - begin)) {
+            if (!flow) {
+                std::size_t trailing = end + 1;
+                while (trailing < line_end && is_space(source_[trailing])) ++trailing;
+                if (trailing < line_end &&
+                    (source_[trailing] != '#' || trailing == end + 1)) {
+                    fail_at("unexpected content after quoted scalar", trailing);
+                    return nullptr;
+                }
+            }
+            ++index;
+            if (after) *after = end + 1;
+            return make_scalar(document_->source_text(begin, end - begin),
+                               quote == '\'' ? node_style::single_quoted
+                                             : node_style::double_quoted, start);
+        }
+    }
     std::string decoded;
     std::size_t position = start + 1;
     std::size_t current_line = index;
@@ -3393,6 +3559,7 @@ node_data* yaml_parser::parse_quoted(std::size_t& index, std::size_t start, char
             while (current_line < lines_.size() && lines_[current_line].number <= ending_line)
                 ++current_line;
             index = current_line;
+            if (after) *after = position;
             return make_scalar(document_->pooled_text(decoded),
                                quote == '\'' ? node_style::single_quoted
                                              : node_style::double_quoted,
@@ -3629,30 +3796,17 @@ void yaml_parser::flow_skip(flow_cursor& cursor) {
 }
 
 node_data* yaml_parser::parse_flow_quoted(flow_cursor& cursor, char quote) {
-    std::size_t fake_line = 0;
-    while (fake_line + 1 < lines_.size() && lines_[fake_line + 1].start <= cursor.position)
-        ++fake_line;
-    node_data* value = parse_quoted(fake_line, cursor.position, quote, true, 0);
-    if (!value) return nullptr;
-    std::size_t p = cursor.position + 1;
-    while (p < cursor.limit) {
-        if (source_[p] == quote) {
-            if (quote == '\'' && p + 1 < cursor.limit && source_[p + 1] == '\'') {
-                p += 2;
-                continue;
-            }
-            cursor.position = p + 1;
-            return value;
-        }
-        if (quote == '"' && source_[p] == '\\' && p + 1 < cursor.limit) p += 2;
-        else ++p;
-    }
-    return value;
+    // location() already caches the current physical line. Starting at line
+    // zero for every quoted flow item makes a long collection quadratic.
+    (void)location(cursor.position);
+    std::size_t line = location_hint_;
+    return parse_quoted(line, cursor.position, quote, true, 0, &cursor.position);
 }
 
 node_data* yaml_parser::parse_flow_plain(flow_cursor& cursor, bool key_context) {
     const std::size_t start = cursor.position;
     std::size_t end = start;
+    std::size_t first_break = cursor.limit;
     while (cursor.position < cursor.limit) {
         const char current = source_[cursor.position];
         if (current == ',' || current == ']' || current == '}' ||
@@ -3664,6 +3818,8 @@ node_data* yaml_parser::parse_flow_plain(flow_cursor& cursor, bool key_context) 
             source_[cursor.position + 1] == ']' || source_[cursor.position + 1] == '}')) break;
         ++cursor.position;
         if (!is_space(current) && !is_break(current)) end = cursor.position;
+        else if (is_break(current) && first_break == cursor.limit)
+            first_break = cursor.position - 1;
     }
     if (end == start) {
         fail_at("expected a flow scalar", start);
@@ -3671,16 +3827,19 @@ node_data* yaml_parser::parse_flow_plain(flow_cursor& cursor, bool key_context) 
     }
     auto raw = source_.substr(start, end - start);
     const auto [plain_line, plain_column] = location(start);
-    if (plain_column == 1 && (trim_view(raw) == "---" || trim_view(raw) == "...")) {
+    if (plain_column == 1 && (raw == "---" || raw == "...")) {
         fail_at("document markers are not allowed inside flow collections", start);
         return nullptr;
     }
-    if (trim_view(raw) == "-") {
+    if (raw == "-") {
         fail_at("invalid flow scalar indicator", start);
         return nullptr;
     }
-    if (raw.find_first_of("\r\n") == std::string_view::npos)
-        return make_scalar(document_->source_text(start, end - start), node_style::plain, start);
+    // Remember breaks during the delimiter scan, including bare CR. Trailing
+    // whitespace is outside raw and must not trigger folding of internal spaces.
+    if (first_break >= end)
+        return make_scalar_at(document_->source_text(start, end - start),
+                              node_style::plain, plain_line, plain_column);
     std::string folded;
     bool whitespace = false;
     for (char c : raw) {
@@ -3691,7 +3850,8 @@ node_data* yaml_parser::parse_flow_plain(flow_cursor& cursor, bool key_context) 
             folded.push_back(c);
         }
     }
-    return make_scalar(document_->pooled_text(folded), node_style::plain, start);
+    return make_scalar_at(document_->pooled_text(folded), node_style::plain,
+                          plain_line, plain_column);
 }
 
 node_data* yaml_parser::parse_flow_node(flow_cursor& cursor, bool key_context) {
@@ -3701,10 +3861,14 @@ node_data* yaml_parser::parse_flow_node(flow_cursor& cursor, bool key_context) {
         return make_empty(line, column);
     }
     std::size_t position = cursor.position;
-    properties props = parse_properties(position, cursor.limit);
+    properties props;
+    if (source_[position] == '&' || source_[position] == '!') {
+        props = parse_properties(position, cursor.limit);
+        if (has_error()) return nullptr;
+        cursor.position = position;
+        flow_skip(cursor);
+    }
     if (has_error()) return nullptr;
-    cursor.position = position;
-    flow_skip(cursor);
     if (cursor.position >= cursor.limit) {
         node_data* empty = make_empty(location(position).first, location(position).second);
         apply_properties(empty, props);
@@ -3751,7 +3915,7 @@ node_data* yaml_parser::parse_flow_node(flow_cursor& cursor, bool key_context) {
     }
     default: value = parse_flow_plain(cursor, key_context); break;
     }
-    apply_properties(value, props);
+    if (props.any) apply_properties(value, props);
     return value;
 }
 
